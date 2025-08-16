@@ -158,13 +158,86 @@ def geocode_address(addr: str):
 # ---------------------------
 
 @st.cache_data(show_spinner=False, ttl=60*60)
+def get_layer_fields(service_url: str, layer: int):
+    """Fetch ArcGIS layer field metadata and return a dict keyed by lowercase name."""
+    try:
+        meta = requests.get(f"{service_url}/{layer}", params={"f": "json"}, timeout=20).json()
+        fields = meta.get("fields", []) if isinstance(meta, dict) else []
+        return { (f.get("name") or "").lower(): f for f in fields }
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False, ttl=60*60)
 def get_property_by_folio(folio: str):
-    """Look up a property by folio using simple, standardized WHERE clauses.
-    Tries hyphenated equality first, then a digits LIKE fallback. Avoids SQL functions.
+    """Look up a property by folio using the actual field name discovered from layer metadata.
+    Tries equality on hyphenated + digits-only; then a digits LIKE fallback. Avoids SQL functions.
     Returns {"attributes": {...}} or None.
     """
     if not folio:
         return None
+
+    raw = str(folio).strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+
+    def hyph(d: str) -> str:
+        return f"{d[0:2]}-{d[2:6]}-{d[6:9]}-{d[9:13]}" if len(d) == 13 else d
+
+    hyphenated = hyph(digits) if digits else raw
+
+    # Discover the folio field name (case/alias-proof)
+    fields_meta = get_layer_fields(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW)
+    folio_field = None
+    for cand in ["folio", "folio_num", "folio_nbr", "folioid", "folio_number", "md_folio"]:
+        if cand in fields_meta:
+            folio_field = fields_meta[cand]["name"]
+            break
+    if folio_field is None:
+        for k, v in fields_meta.items():
+            if "folio" in k:
+                folio_field = v.get("name")
+                break
+    folio_field = folio_field or "folio"
+
+    def esc(s: str) -> str:
+        return s.replace("'", "''")
+
+    wheres = []
+    if hyphenated:
+        wheres.append(f"{folio_field} = '{esc(hyphenated)}'")
+    if digits and len(digits) == 13:
+        wheres.append(f"{folio_field} = '{esc(digits)}'")
+        wheres.append(f"{folio_field} LIKE '%{esc(digits)}%'")
+
+    fields = [
+        "folio","true_site_addr","true_site_city","true_site_zip_code",
+        "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
+        "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
+        "pa_primary_zone","primarylanduse_desc","mailing_address1","mailing_address2","mailing_city","mailing_state","mailing_zip"
+    ]
+
+    for w in wheres:
+        params = {"where": w, "outFields": ",".join(fields), "returnGeometry": False}
+        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
+        feats = (data or {}).get("features", [])
+        if feats:
+            for f in feats:
+                a = f.get("attributes", {})
+                af = str(a.get("folio") or a.get(folio_field) or "")
+                if af and (af.replace("-", "") == digits or af == hyphenated):
+                    a["_where_used"] = w
+                    a["_folio_field"] = folio_field
+                    return {"attributes": a}
+            a = feats[0].get("attributes", {})
+            a["_where_used"] = w
+            a["_folio_field"] = folio_field
+            return {"attributes": a}
+
+    # Probe service health
+    probe = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, {"where": "1=1", "returnIdsOnly": True})
+    if not probe or not probe.get("objectIds"):
+        st.info("The Property Point layer is not returning IDs right now — the Open Data service may be down.")
+    return None
 
     raw = str(folio).strip()
     digits = "".join(ch for ch in raw if ch.isdigit())
@@ -220,77 +293,7 @@ def get_property_by_folio(folio: str):
         st.info("Folio service probe returned no IDs. The Open Data service may be temporarily unavailable.")
 
     return None
-
-
-    folio_raw = str(folio).strip()
-    folio_digits = "".join(ch for ch in folio_raw if ch.isdigit())
-
-    def fmt_md_folio(digits: str) -> str:
-        # Miami‑Dade folio: 13 digits -> 2-4-3-4
-        if len(digits) == 13:
-            return f"{digits[0:2]}-{digits[2:6]}-{digits[6:9]}-{digits[9:13]}"
-        return digits
-
-    folio_hyph = fmt_md_folio(folio_digits) if folio_digits else folio_raw
-
-    fields = [
-        "folio","true_site_addr","true_site_city","true_site_zip_code",
-        "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
-        "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
-        "pa_primary_zone","primarylanduse_desc","mailing_address1","mailing_address2","mailing_city","mailing_state","mailing_zip"
-    ]
-
-    # Escape single quotes for ArcGIS SQL
-    def esc(s: str) -> str:
-        return s.replace("'", "''")
-
-    candidates = [v for v in [folio_hyph, folio_raw, folio_digits] if v]
-
-    wheres = []
-    for v in candidates:
-        vq = esc(v)
-        wheres.append(f"folio = '{vq}'")
-        wheres.append(f"UPPER(folio) = UPPER('{vq}')")
-    # fuzzy fallback on digits if we have them
-    if folio_digits:
-        wheres.append(f"folio LIKE '%{esc(folio_digits)}%'")
-        wheres.append(f"parent_folio = '{esc(folio_hyph)}'")
-
-    for w in wheres:
-        params = {
-            "where": w,
-            "outFields": ",".join(fields),
-            "returnGeometry": False,
-            "sqlFormat": "standard",
-        }
-        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
-        feats = (data or {}).get("features", [])
-        if feats:
-            # Prefer exact hyphenated match if present
-            for f in feats:
-                a = f.get("attributes", {})
-                afolio = str(a.get("folio", "") or "").strip()
-                if afolio and (afolio == folio_hyph or afolio.replace("-", "") == folio_digits):
-                    return {"attributes": a}
-            return {"attributes": feats[0].get("attributes", {})}
-
-    # As a last resort, try objectIds route with a broad LIKE only if digits exist
-    if folio_digits:
-        params_ids = {"where": f"folio LIKE '%{esc(folio_digits)}%'", "returnIdsOnly": True}
-        data_ids = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params_ids)
-        if data_ids and data_ids.get("objectIds"):
-            oid = data_ids["objectIds"][0]
-            params_oid = {
-                "objectIds": oid,
-                "outFields": ",".join(fields),
-                "returnGeometry": False,
-            }
-            data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params_oid)
-            feats = (data or {}).get("features", [])
-            if feats:
-                return {"attributes": feats[0].get("attributes", {})}
-
-    return None
+# (Removed legacy duplicate folio lookup code block)
     folio = "".join(ch for ch in folio if ch.isdigit())
     if not folio:
         return None
