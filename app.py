@@ -291,3 +291,40 @@ with st.expander("📊 Planning, Research & Economic Analysis – quick links"):
     st.link_button("Planning & Research Reports", LINK_PLANNING_RESEARCH)
 
 st.caption("Data & sources: Miami-Dade Property Appraiser • Miami-Dade GIS Open Data Hub • Miami-Dade Clerk of Courts • Planning, Research & Economic Analysis. Unofficial convenience tool.")
+
+# ---------------------------
+# (Repo files below — copy each to its own file at repo root)
+# ---------------------------
+
+# requirements.txt (create this file at repo root)
+# -----------------------------------------------
+# Web app & viz
+# streamlit==1.37.1
+# streamlit-folium==0.20.0
+# folium==0.17.0
+#
+# Data
+# pandas==2.2.2
+# requests==2.32.3
+
+# runtime.txt (create this file at repo root)
+# ------------------------------------------
+# python-3.11.9
+
+# .streamlit/config.toml (make a folder named .streamlit and put this inside)
+# -----------------------------------------------------
+# [server]
+# headless = true
+# port = 8501
+# enableCORS = false
+# enableXsrfProtection = true
+#
+# [browser]
+# gatherUsageStats = false
+#
+# [theme]
+# primaryColor = "#0066CC"
+# backgroundColor = "#FFFFFF"
+# secondaryBackgroundColor = "#F6F8FA"
+# textColor = "#0F1419"
+# font = "sans serif"
