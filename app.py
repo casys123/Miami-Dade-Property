@@ -248,7 +248,7 @@ def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 3000):
 
     # Client-side filter by days
     if days and "dateofsale_utc" in df.columns:
-        cutoff = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=int(days))
+        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(days))
         mask = df["dateofsale_utc"] >= cutoff
         df = df[mask]
 
