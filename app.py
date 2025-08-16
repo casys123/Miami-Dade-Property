@@ -1,5 +1,5 @@
 # app.py
-# Miami-Dade Property & Market Insights Dashboard (CSV export + Recent Sales)
+# Miami-Dade Property & Market Insights Dashboard (CSV export + Recent Sales + Folio Lookup)
 
 import json
 import requests
@@ -42,54 +42,9 @@ def pa_folio_url(folio: str) -> str:
 # Utilities
 # ---------------------------
 
-def _rdp_simplify(points, eps):
-    """Douglas–Peucker polyline simplification for a ring (list of (lon,lat)).
-    eps is tolerance in degrees (~ meters/111_320)."""
-    if len(points) < 3:
-        return points
-    # perpendicular distance from point p to line ab
-    def _perp(p, a, b):
-        (x, y), (x1, y1), (x2, y2) = p, a, b
-        if (x1, y1) == (x2, y2):
-            return ((x-x1)**2 + (y-y1)**2) ** 0.5
-        t = ((x-x1)*(x2-x1) + (y-y1)*(y2-y1)) / ((x2-x1)**2 + (y2-y1)**2)
-        t = max(0.0, min(1.0, t))
-        proj = (x1 + t*(x2-x1), y1 + t*(y2-y1))
-        return ((x-proj[0])**2 + (y-proj[1])**2) ** 0.5
-    # recursive DP
-    def _dp(pts):
-        if len(pts) <= 2:
-            return pts
-        a, b = pts[0], pts[-1]
-        dmax, idx = 0.0, -1
-        for i in range(1, len(pts)-1):
-            d = _perp(pts[i], a, b)
-            if d > dmax:
-                dmax, idx = d, i
-        if dmax > eps and idx != -1:
-            left = _dp(pts[:idx+1])
-            right = _dp(pts[idx:])
-            return left[:-1] + right
-        else:
-            return [a, b]
-    # Ensure closed ring (repeat first point at end)
-    closed = points[0] == points[-1]
-    core = points[:-1] if closed else points
-    simp = _dp(core)
-    if closed:
-        simp.append(simp[0])
-    return simp
-
-def simplify_rings(rings, tolerance_meters=20):
-    """Return simplified rings using a Douglas–Peucker tolerance in meters."""
-    # crude deg per meter conversion near Miami (~ 1 deg lat ≈ 111_320 m)
-    eps_deg = max(1e-6, tolerance_meters / 111_320.0)
-    out = []
-    for ring in rings:
-        out.append(_rdp_simplify(ring, eps_deg))
-    return out
 @st.cache_data(show_spinner=False, ttl=60*60)
 def arcgis_query(service_url: str, layer: int, params: dict):
+    """Generic ArcGIS FeatureServer query with GET/POST auto-switch to avoid 413s."""
     base = f"{service_url}/{layer}/query"
     defaults = {
         "f": "json",
@@ -100,7 +55,6 @@ def arcgis_query(service_url: str, layer: int, params: dict):
     }
     q = {**defaults, **(params or {})}
     try:
-        # Use POST when geometry is present or URL would be too long to avoid 413 errors
         use_post = ("geometry" in q) or (len(base) + len(str(q)) > 1800)
         if use_post:
             r = requests.post(base, data=q, timeout=30, headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -115,6 +69,48 @@ def arcgis_query(service_url: str, layer: int, params: dict):
         st.info(f"ArcGIS query unavailable (layer {layer}). Details: {e}")
         return None
 
+# --- Geometry helpers (simplify big polygons to keep payloads small) ---
+
+def _rdp_simplify(points, eps):
+    """Douglas–Peucker on a single ring: list[(lon,lat)] → simplified ring."""
+    if len(points) < 3:
+        return points
+
+    def _perp(p, a, b):
+        (x, y), (x1, y1), (x2, y2) = p, a, b
+        if (x1, y1) == (x2, y2):
+            return ((x-x1)**2 + (y-y1)**2) ** 0.5
+        t = ((x-x1)*(x2-x1) + (y-y1)*(y2-y1)) / ((x2-x1)**2 + (y2-y1)**2)
+        t = max(0.0, min(1.0, t))
+        proj = (x1 + t*(x2-x1), y1 + t*(y2-y1))
+        return ((x-proj[0])**2 + (y-proj[1])**2) ** 0.5
+
+    def _dp(pts):
+        if len(pts) <= 2:
+            return pts
+        a, b = pts[0], pts[-1]
+        dmax, idx = 0.0, -1
+        for i in range(1, len(pts)-1):
+            d = _perp(pts[i], a, b)
+            if d > dmax:
+                dmax, idx = d, i
+        if dmax > eps and idx != -1:
+            left = _dp(pts[:idx+1])
+            right = _dp(pts[idx:])
+            return left[:-1] + right
+        return [a, b]
+
+    closed = points[0] == points[-1]
+    core = points[:-1] if closed else points
+    simp = _dp(core)
+    if closed:
+        simp.append(simp[0])
+    return simp
+
+def simplify_rings(rings, tolerance_meters=25):
+    eps_deg = max(1e-6, tolerance_meters / 111_320.0)
+    return [_rdp_simplify(r, eps_deg) for r in rings]
+
 @st.cache_data(show_spinner=False, ttl=60*60)
 def fetch_municipalities():
     data = arcgis_query(MD_ZONING_FEATURESERVER, LAYER_MUNICIPAL_BOUNDARY, {
@@ -127,13 +123,10 @@ def fetch_municipalities():
             attrs = f.get("attributes", {})
             geom = f.get("geometry", {})
             name = attrs.get("NAME") or attrs.get("Municipality") or attrs.get("municipality")
-            if not name:
+            rings = (geom or {}).get("rings")
+            if not name or not rings:
                 continue
-            rings = geom.get("rings")
-            if not rings:
-                continue
-            first_poly = rings[0]
-            items.append({"name": name, "rings": [first_poly]})
+            items.append({"name": name, "rings": [rings[0]]})
     return sorted(items, key=lambda x: x["name"]) if items else []
 
 @st.cache_data(show_spinner=False, ttl=60*60)
@@ -144,45 +137,47 @@ def geocode_address(addr: str):
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": addr, "format": "json", "limit": 1},
-            headers={"User-Agent": "mdc-dashboard/1.1 (Streamlit)"},
+            headers={"User-Agent": "mdc-dashboard/1.2 (Streamlit)"},
             timeout=20,
         )
         r.raise_for_status()
-        results = r.json()
+        results = r.json() or []
         if results:
-            lat = float(results[0]["lat"])
-            lon = float(results[0]["lon"])
-            return (lat, lon)
-        return None
+            return (float(results[0]["lat"]), float(results[0]["lon"]))
     except Exception:
-        return None
+        pass
+    return None
+
+# ---------------------------
+# Data accessors
+# ---------------------------
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_property_by_folio(folio: str):
-    """Return core attributes for a folio from the Property Appraiser GIS view."""
+    """Return a dict with attributes/geometry for a folio from PA GIS view."""
     if not folio:
-        return pd.DataFrame()
-    folio = folio.strip().replace("-", "")
+        return None
+    folio = "".join(ch for ch in folio if ch.isdigit())
+    if not folio:
+        return None
     params = {
         "where": f"folio = '{folio}'",
         "outFields": ",".join([
             "folio","true_site_addr","true_site_city","true_site_zip_code",
             "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
             "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
-            "pa_primary_zone","primarylanduse_desc"
+            "pa_primary_zone","primarylanduse_desc","mailing_address1","mailing_address2","mailing_city","mailing_state","mailing_zip"
         ]),
-        "returnGeometry": False,
+        "returnGeometry": True,
     }
     data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
     feats = (data or {}).get("features", [])
     if not feats:
-        return pd.DataFrame()
-    row = feats[0].get("attributes", {})
-    row["beds"] = row.get("bedrooms")
-    row["baths"] = row.get("bathrooms")
-    row["half_baths"] = row.get("half_bathrooms")
-    row["primary_land_use"] = row.get("primarylanduse_desc") or row.get("dor_desc")
-    return pd.DataFrame([row])
+        return None
+    feat = feats[0]
+    attrs = feat.get("attributes", {})
+    geom = feat.get("geometry") or {}
+    return {"attributes": attrs, "geometry": geom}
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_zoning_at_point(lon: float, lat: float):
@@ -201,10 +196,8 @@ def get_zoning_at_point(lon: float, lat: float):
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_zones_in_polygon(rings):
-    # Proactively simplify large polygons to avoid 413 on ArcGIS (URL/body too big)
-    orig_len = sum(len(r) for r in rings)
     use_rings = rings
-    if orig_len > 1500:
+    if sum(len(r) for r in rings) > 1500:
         use_rings = simplify_rings(rings, tolerance_meters=25)
     poly = {"rings": use_rings, "spatialReference": {"wkid": 4326}}
     data = arcgis_query(MD_ZONING_FEATURESERVER, LAYER_ZONING, {
@@ -218,25 +211,19 @@ def get_zones_in_polygon(rings):
     })
     if not data or not data.get("features"):
         return pd.DataFrame(columns=["ZONE", "ZONE_DESC"])
-    rows = []
-    for f in data["features"]:
-        a = f.get("attributes", {})
-        rows.append({"ZONE": a.get("ZONE"), "ZONE_DESC": a.get("ZONE_DESC")})
+    rows = [{"ZONE": f.get("attributes", {}).get("ZONE"),
+             "ZONE_DESC": f.get("attributes", {}).get("ZONE_DESC")} for f in data["features"]]
     return pd.DataFrame(rows).dropna().drop_duplicates().sort_values(by=["ZONE", "ZONE_DESC"]).reset_index(drop=True)
 
 @st.cache_data(show_spinner=False, ttl=30*60)
 def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
-    """Recent sales inside polygon.
-    Strategy:
-      1) Spatial filter by polygon (POST)
-      2) Pull up to `max_rows` with pagination (no fragile server-side date WHERE)
-      3) Auto-detect a sale date field (prefers 'dateofsale_utc') and filter client-side
-    """
-    # --- Helper: paginate ArcGIS queries ---
+    """Fetch recent sales by polygon with pagination; filter by date client-side."""
     def _paged_query(base_params, step=2000, hard_cap=max_rows):
         rows = []
         offset = 0
         while True:
+            if len(rows) >= hard_cap:
+                break
             params = dict(base_params)
             params["resultRecordCount"] = min(step, hard_cap - len(rows))
             params["resultOffset"] = offset
@@ -244,14 +231,12 @@ def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
             feats = (data or {}).get("features", [])
             if not feats:
                 break
-            for f in feats:
-                rows.append(f.get("attributes", {}))
-            if len(rows) >= hard_cap or len(feats) < params["resultRecordCount"]:
+            rows.extend([f.get("attributes", {}) for f in feats])
+            if len(feats) < params["resultRecordCount"]:
                 break
             offset += params["resultRecordCount"]
         return rows
 
-    # --- Simplify polygon if huge to avoid 413s ---
     use_rings = rings
     if sum(len(r) for r in rings) > 1500:
         use_rings = simplify_rings(rings, tolerance_meters=25)
@@ -267,8 +252,6 @@ def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
             "true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"
         ]),
         "returnGeometry": False,
-        # Avoid relying on a specific field name for ordering
-        # We'll sort locally after parsing dates
         "geometryPrecision": 6,
     }
 
@@ -278,19 +261,9 @@ def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
 
     df = pd.DataFrame(attrs)
 
-    # --- Pick a sale date column robustly ---
-    candidate_cols = [
-        "dateofsale_utc", "dateofsale", "sale_date", "last_sale_date", "date_of_sale", "saledate"
-    ]
+    # Detect and parse sale date
+    candidate_cols = ["dateofsale_utc", "dateofsale", "sale_date", "last_sale_date", "date_of_sale", "saledate"]
     date_col = next((c for c in candidate_cols if c in df.columns), None)
-    if date_col is None:
-        # fallback: heuristic - first column that contains both 'date' and 'sale'
-        for c in df.columns:
-            lc = c.lower()
-            if "date" in lc and "sale" in lc:
-                date_col = c
-                break
-    # Parse dates if we found any
     if date_col:
         s = df[date_col]
         if pd.api.types.is_numeric_dtype(s):
@@ -299,67 +272,25 @@ def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
             df[date_col] = pd.to_datetime(s, utc=True, errors="coerce")
         cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(days))
         df = df[df[date_col] >= cutoff]
-        # Rename to common name for UI
         if date_col != "dateofsale_utc":
             df.rename(columns={date_col: "dateofsale_utc"}, inplace=True)
-    else:
-        # No date field detected; skip date filtering
-        pass
 
-    # Normalize price
     if "price_1" in df.columns:
         df["price_1"] = pd.to_numeric(df["price_1"], errors="coerce")
 
-    # Friendly display date (drop tz)
     if "dateofsale_utc" in df.columns:
         try:
             df["dateofsale_utc"] = pd.to_datetime(df["dateofsale_utc"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
         except Exception:
             pass
-
-    # Sort newest first if we have the date
-    if "dateofsale_utc" in df.columns:
         df = df.sort_values("dateofsale_utc", ascending=False)
 
     return df.reset_index(drop=True)
 
 # ---------------------------
-# Folio Lookup helpers
-# ---------------------------
-
-def _only_digits(s: str) -> str:
-    return "".join(ch for ch in (s or "") if ch.isdigit())
-
-@st.cache_data(show_spinner=False, ttl=30*60)
-def get_property_by_folio(folio_str: str):
-    folio_num = _only_digits(folio_str)
-    if not folio_num:
-        return None
-    params = {
-        "where": f"folio='{folio_num}'",
-        "outFields": "*",
-        "returnGeometry": True,
-    }
-    data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
-    if not data or not data.get("features"):
-        return None
-    feat = data["features"][0]
-    attrs = feat.get("attributes", {})
-    geom = feat.get("geometry") or {}
-    # Try zoning at the property point if we have geometry
-    zoning = None
-    try:
-        if geom and {k for k in geom.keys() if k in ("x","y")}:
-            lon = geom.get("x"); lat = geom.get("y")
-            if lon is not None and lat is not None:
-                zoning = get_zoning_at_point(lon=float(lon), lat=float(lat))
-    except Exception:
-        pass
-    return {"attributes": attrs, "geometry": geom, "zoning": zoning}
-
-# ---------------------------
 # UI
 # ---------------------------
+
 st.title("🏝️ Miami-Dade Property & Market Insights")
 st.caption("Powered by Miami-Dade County Open Data & official portals.")
 
@@ -386,6 +317,7 @@ with st.sidebar:
 
 col_map, col_info = st.columns([1.2, 0.8])
 
+# --- Map column ---
 with col_map:
     m = folium.Map(location=[25.774, -80.193], zoom_start=10, control_scale=True)
 
@@ -415,37 +347,46 @@ with col_map:
     else:
         st.warning("streamlit-folium not installed. Map preview disabled. Please add 'streamlit-folium' to requirements.txt.")
 
+# --- Info column ---
 with col_info:
     st.subheader("Property by Folio")
-    if 'folio' in locals() and folio:
-        df_prop = get_property_by_folio(folio)
-        if not df_prop.empty:
-            r = df_prop.iloc[0].to_dict()
-            st.success(f"**Folio:** {r.get('folio','')}")
-            addr_line = r.get('true_site_addr') or ''
-            city_zip = " ".join([str(r.get('true_site_city') or ''), str(r.get('true_site_zip_code') or '')]).strip()
-            owner1 = r.get('true_owner1') or ''
-            owner2 = r.get('true_owner2') or ''
-            cols = st.columns(2)
-            with cols[0]:
+    if folio:
+        prop = get_property_by_folio(folio)
+        if prop:
+            a = prop.get("attributes", {})
+            # Top line
+            st.success(f"Folio: {a.get('folio','')}")
+            # Address & owners
+            addr_line = a.get('true_site_addr') or ''
+            city_zip = " ".join([str(a.get('true_site_city') or ''), str(a.get('true_site_zip_code') or '')]).strip()
+            owner1 = a.get('true_owner1') or ''
+            owner2 = a.get('true_owner2') or ''
+            c1, c2 = st.columns(2)
+            with c1:
                 if addr_line:
-                    st.markdown(f"**Property Address**  
-{addr_line}")
+                    st.markdown(f"**Property Address:** {addr_line}")
                 if city_zip:
                     st.markdown(city_zip)
-            with cols[1]:
-                if owner1 or owner2:
-                    st.markdown("**Owner**  ")
-                    st.markdown("<br/>".join([x for x in [owner1, owner2] if x]), unsafe_allow_html=True)
-            st.markdown(
-                (f"**PA Primary Zone:** {r.get('pa_primary_zone')}  " if r.get('pa_primary_zone') else "")+
-                (f"**Primary Land Use:** {r.get('primary_land_use')}  " if r.get('primary_land_use') else "")+
-                (f"**Subdivision:** {r.get('subdivision') if r.get('subdivision') else ''}")
-            )
+            with c2:
+                owners = "<br/>".join([x for x in [owner1, owner2] if x])
+                if owners:
+                    st.markdown("**Owner(s):**  ")
+                    st.markdown(owners, unsafe_allow_html=True)
+            # Zoning/Use
+            pa_zone = a.get('pa_primary_zone')
+            use_desc = a.get('primarylanduse_desc') or a.get('dor_desc')
+            subdiv = a.get('subdivision')
+            parts = []
+            if pa_zone: parts.append(f"**PA Primary Zone:** {pa_zone}")
+            if use_desc: parts.append(f"**Primary Land Use:** {use_desc}")
+            if subdiv: parts.append(f"**Subdivision:** {subdiv}")
+            if parts:
+                st.markdown("  • ".join(parts))
+            # Building details
             kmap = {
-                "beds": "Beds",
-                "baths": "Baths",
-                "half_baths": "Half Baths",
+                "bedrooms": "Beds",
+                "bathrooms": "Baths",
+                "half_bathrooms": "Half Baths",
                 "no_stories": "Floors",
                 "living_units": "Living Units",
                 "actual_area": "Actual Area (SqFt)",
@@ -454,7 +395,7 @@ with col_info:
                 "lot_size": "Lot Size (SqFt)",
                 "year_built": "Year Built",
             }
-            disp = {v: r.get(k) for k,v in kmap.items() if r.get(k) is not None}
+            disp = {v: a.get(k) for k, v in kmap.items() if a.get(k) is not None}
             if disp:
                 df_disp = pd.DataFrame([disp]).T.reset_index()
                 df_disp.columns = ["Attribute", "Value"]
@@ -464,51 +405,6 @@ with col_info:
             st.info("No property found for that folio in the Open Data layer. Double-check the 13-digit folio or open the Property Appraiser search.")
     else:
         st.caption("Enter a 13-digit folio in the sidebar to see property details here.")
-
-    
-    st.subheader("Lookup by Folio")
-    if folio:
-        prop = get_property_by_folio(folio)
-        if prop:
-            a = prop.get("attributes", {})
-            z = prop.get("zoning") or {}
-            # Compose owner lines
-            owners = ", ".join([x for x in [a.get("true_owner1"), a.get("true_owner2"), a.get("true_owner3"), a.get("true_owner4")] if x]) or "—"
-            mailing_bits = [a.get("mailing_address1"), a.get("mailing_address2"), a.get("mailing_city"), a.get("mailing_state"), a.get("mailing_zip")]
-            mailing = ", ".join([b for b in mailing_bits if b]) or "—"
-            # Basic facts
-            facts = {
-                "Folio": a.get("folio"),
-                "Subdivision": a.get("subdivision") or "—",
-                "Property Address": a.get("true_site_addr") or "—",
-                "City/ZIP": ", ".join([b for b in [a.get("true_site_city"), a.get("true_site_zip_code")] if b]) or "—",
-                "Owner(s)": owners,
-                "Mailing Address": mailing,
-                "PA Primary Zone": (z.get("ZONE") if z else a.get("pa_primary_zone")) or "—",
-                "Primary Land Use": a.get("dor_desc") or "—",
-                "Beds / Baths / Half": " / ".join([
-                    str(a.get("bedrooms")) if a.get("bedrooms") is not None else "-",
-                    str(a.get("bathrooms")) if a.get("bathrooms") is not None else "-",
-                    str(a.get("half_bath")) if a.get("half_bath") is not None else "-",
-                ]),
-                "Floors": a.get("stories") or a.get("floors") or "—",
-                "Living Units": a.get("num_units") or a.get("living_units") or "—",
-                "Actual Area": (f"{int(a.get('actual_area')):,} Sq.Ft" if a.get("actual_area") else "—"),
-                "Living Area": (f"{int(a.get('building_heated_area')):,} Sq.Ft" if a.get("building_heated_area") else (f"{int(a.get('living_area')):,} Sq.Ft" if a.get("living_area") else "—")),
-                "Adjusted Area": (f"{int(a.get('adjusted_area')):,} Sq.Ft" if a.get("adjusted_area") else "—"),
-                "Lot Size": (f"{int(a.get('lot_size')):,} Sq.Ft" if a.get("lot_size") else "—"),
-                "Year Built": a.get("year_built") or "—",
-            }
-            st.json(facts, expanded=False)
-            # Useful links
-            if a.get("folio"):
-                folio_link = f"{LINK_PROPERTY_APPRAISER}?searchOption=folio&searchValue={a.get('folio')}"
-                st.link_button("Open in Property Appraiser", folio_link)
-                st.link_button("Search Official Records (Clerk)", LINK_CLERK_OFFICIAL_RECORDS)
-        else:
-            st.warning("No property found for that folio. Make sure it's 13 digits (numbers only).")
-    else:
-        st.caption("Enter a folio number in the sidebar to fetch property details.")
 
     st.subheader("Property & Zoning at Location")
     if pt_latlon:
@@ -533,6 +429,7 @@ with col_info:
     )
     st.markdown(f"**Clerk of Courts (Official Records):** <a href='{LINK_CLERK_OFFICIAL_RECORDS}' target='_blank'>Open search</a>", unsafe_allow_html=True)
 
+# --- Area summaries ---
 if selected_poly:
     st.markdown("---")
     st.subheader(f"Zoning mix in **{selected_muni}**")
@@ -588,12 +485,9 @@ st.caption("Data & sources: Miami-Dade Property Appraiser • Miami-Dade GIS Ope
 
 # requirements.txt (create this file at repo root)
 # -----------------------------------------------
-# Web app & viz
 # streamlit==1.37.1
 # streamlit-folium==0.20.0
 # folium==0.17.0
-#
-# Data
 # pandas==2.2.2
 # requests==2.32.3
 
