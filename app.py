@@ -45,6 +45,18 @@ LINK_ECONOMIC_DASH = "https://www.miamidade.gov/global/economy/innovation-and-ec
 # Helpers
 # ---------------------------
 
+def format_md_folio(input_str: str):
+    """Return (hyphenated, digits) for a Miami‑Dade folio input.
+    If the input has 13 digits, we format as xx-xxxx-xxx-xxxx.
+    """
+    s = (input_str or "").strip()
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) == 13:
+        hyph = f"{digits[0:2]}-{digits[2:6]}-{digits[6:9]}-{digits[9:13]}"
+        return hyph, digits
+    return s, digits
+
+
 def pa_folio_url(folio: str) -> str:
     digits = "".join(ch for ch in (folio or "") if ch.isdigit())
     return f"https://www.miamidade.gov/Apps/PA/propertysearch/#/folio/{digits}" if digits else LINK_PROPERTY_APPRAISER
@@ -391,7 +403,11 @@ with st.sidebar:
     st.markdown("**Look up specific properties** (opens official sites in a new tab):")
     addr = st.text_input("Address (for map & Property Appraiser link)")
     owner = st.text_input("Owner Name (for Property Appraiser & Clerk search)")
-    folio = st.text_input("Folio Number (13 digits)")
+    folio_input = st.text_input("Folio Number (13 digits)")
+    folio_hyph, folio_digits = format_md_folio(folio_input)
+    if folio_digits and len(folio_digits) == 13 and folio_input != folio_hyph:
+        st.caption(f"Using normalized folio: **{folio_hyph}**")
+    folio = folio_hyph or folio_input
 
     st.markdown("**Recent Sales Window**")
     sales_window = st.slider("Days back", min_value=7, max_value=365, value=90, step=7)
@@ -498,8 +514,40 @@ with col_info:
 
             with st.expander("Folio lookup diagnostics"):
                 st.write({"source": result.get("source"), "where_used": result.get("where_used")})
+
+            # --- CSV export for this property ---
+            export = {
+                "Folio": a.get('folio') or folio,
+                "Property Address": a.get('true_site_addr'),
+                "City": a.get('true_site_city'),
+                "ZIP": a.get('true_site_zip_code'),
+                "Owner 1": a.get('true_owner1'),
+                "Owner 2": a.get('true_owner2'),
+                "Subdivision": a.get('subdivision'),
+                "Primary Land Use": a.get('primarylanduse_desc') or a.get('dor_desc'),
+                "PA Primary Zone": a.get('pa_primary_zone'),
+                "Beds": a.get('bedrooms'),
+                "Baths": a.get('bathrooms'),
+                "Half Baths": a.get('half_bathrooms'),
+                "Floors": a.get('no_stories'),
+                "Living Units": a.get('living_units'),
+                "Actual Area (SqFt)": a.get('actual_area'),
+                "Living Area (SqFt)": a.get('building_heated_area'),
+                "Adjusted Area (SqFt)": a.get('adjusted_area'),
+                "Lot Size (SqFt)": a.get('lot_size'),
+                "Year Built": a.get('year_built'),
+                "PA Folio URL": pa_folio_url(a.get('folio') or folio),
+            }
+            df_prop = pd.DataFrame([export])
+            csv_prop = df_prop.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "⬇️ Download this property (CSV)",
+                data=csv_prop,
+                file_name=f"property_{''.join(ch for ch in (a.get('folio') or folio) if ch.isdigit())}.csv",
+                mime="text/csv",
+            )
         else:
-            st.info("No property found for that folio via the selected source(s). Try the other source above, or open the Property Appraiser link.")
+            st.info("No property found for that folio via the selected source(s). Try the other source above, or open the Property Appraiser link."))
     else:
         st.caption("Enter a 13-digit folio in the sidebar to see property details here.")
 
