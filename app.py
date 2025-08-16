@@ -32,6 +32,12 @@ LINK_GIS_HUB = "https://gis-mdc.opendata.arcgis.com/"
 LINK_PLANNING_RESEARCH = "https://www.miamidade.gov/global/economy/planning/research-reports.page"
 LINK_ECONOMIC_DASH = "https://www.miamidade.gov/global/economy/innovation-and-economic-development/economic-metrics.page"
 
+# Direct link helper to open PA search prefilled by folio
+
+def pa_folio_url(folio: str) -> str:
+    folio = (folio or "").strip().replace("-", "")
+    return f"https://www.miamidade.gov/Apps/PA/propertysearch/#/folio/{folio}" if folio else LINK_PROPERTY_APPRAISER
+
 # ---------------------------
 # Utilities
 # ---------------------------
@@ -150,6 +156,33 @@ def geocode_address(addr: str):
         return None
     except Exception:
         return None
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def get_property_by_folio(folio: str):
+    """Return core attributes for a folio from the Property Appraiser GIS view."""
+    if not folio:
+        return pd.DataFrame()
+    folio = folio.strip().replace("-", "")
+    params = {
+        "where": f"folio = '{folio}'",
+        "outFields": ",".join([
+            "folio","true_site_addr","true_site_city","true_site_zip_code",
+            "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
+            "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
+            "pa_primary_zone","primarylanduse_desc"
+        ]),
+        "returnGeometry": False,
+    }
+    data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
+    feats = (data or {}).get("features", [])
+    if not feats:
+        return pd.DataFrame()
+    row = feats[0].get("attributes", {})
+    row["beds"] = row.get("bedrooms")
+    row["baths"] = row.get("bathrooms")
+    row["half_baths"] = row.get("half_bathrooms")
+    row["primary_land_use"] = row.get("primarylanduse_desc") or row.get("dor_desc")
+    return pd.DataFrame([row])
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_zoning_at_point(lon: float, lat: float):
@@ -291,6 +324,40 @@ def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
     return df.reset_index(drop=True)
 
 # ---------------------------
+# Folio Lookup helpers
+# ---------------------------
+
+def _only_digits(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+@st.cache_data(show_spinner=False, ttl=30*60)
+def get_property_by_folio(folio_str: str):
+    folio_num = _only_digits(folio_str)
+    if not folio_num:
+        return None
+    params = {
+        "where": f"folio='{folio_num}'",
+        "outFields": "*",
+        "returnGeometry": True,
+    }
+    data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
+    if not data or not data.get("features"):
+        return None
+    feat = data["features"][0]
+    attrs = feat.get("attributes", {})
+    geom = feat.get("geometry") or {}
+    # Try zoning at the property point if we have geometry
+    zoning = None
+    try:
+        if geom and {k for k in geom.keys() if k in ("x","y")}:
+            lon = geom.get("x"); lat = geom.get("y")
+            if lon is not None and lat is not None:
+                zoning = get_zoning_at_point(lon=float(lon), lat=float(lat))
+    except Exception:
+        pass
+    return {"attributes": attrs, "geometry": geom, "zoning": zoning}
+
+# ---------------------------
 # UI
 # ---------------------------
 st.title("🏝️ Miami-Dade Property & Market Insights")
@@ -312,7 +379,8 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown(f"- 📍 Property Appraiser: [Search app]({LINK_PROPERTY_APPRAISER})  ")
-    st.markdown(f"- 📄 Clerk: [Official Records]({LINK_CLERK_OFFICIAL_RECORDS})  ")
+    if folio:
+        st.markdown(f"  • Quick link for folio **{folio}** → [open]({pa_folio_url(folio)})  ")
     st.markdown(f"- 🗺️ GIS Hub: [Open Data]({LINK_GIS_HUB})  ")
     st.markdown(f"- 📊 Econ & Planning: [Research Reports]({LINK_PLANNING_RESEARCH}) · [Metrics Dashboard]({LINK_ECONOMIC_DASH})  ")
 
@@ -348,6 +416,100 @@ with col_map:
         st.warning("streamlit-folium not installed. Map preview disabled. Please add 'streamlit-folium' to requirements.txt.")
 
 with col_info:
+    st.subheader("Property by Folio")
+    if 'folio' in locals() and folio:
+        df_prop = get_property_by_folio(folio)
+        if not df_prop.empty:
+            r = df_prop.iloc[0].to_dict()
+            st.success(f"**Folio:** {r.get('folio','')}")
+            addr_line = r.get('true_site_addr') or ''
+            city_zip = " ".join([str(r.get('true_site_city') or ''), str(r.get('true_site_zip_code') or '')]).strip()
+            owner1 = r.get('true_owner1') or ''
+            owner2 = r.get('true_owner2') or ''
+            cols = st.columns(2)
+            with cols[0]:
+                if addr_line:
+                    st.markdown(f"**Property Address**  
+{addr_line}")
+                if city_zip:
+                    st.markdown(city_zip)
+            with cols[1]:
+                if owner1 or owner2:
+                    st.markdown("**Owner**  ")
+                    st.markdown("<br/>".join([x for x in [owner1, owner2] if x]), unsafe_allow_html=True)
+            st.markdown(
+                (f"**PA Primary Zone:** {r.get('pa_primary_zone')}  " if r.get('pa_primary_zone') else "")+
+                (f"**Primary Land Use:** {r.get('primary_land_use')}  " if r.get('primary_land_use') else "")+
+                (f"**Subdivision:** {r.get('subdivision') if r.get('subdivision') else ''}")
+            )
+            kmap = {
+                "beds": "Beds",
+                "baths": "Baths",
+                "half_baths": "Half Baths",
+                "no_stories": "Floors",
+                "living_units": "Living Units",
+                "actual_area": "Actual Area (SqFt)",
+                "building_heated_area": "Living Area (SqFt)",
+                "adjusted_area": "Adjusted Area (SqFt)",
+                "lot_size": "Lot Size (SqFt)",
+                "year_built": "Year Built",
+            }
+            disp = {v: r.get(k) for k,v in kmap.items() if r.get(k) is not None}
+            if disp:
+                df_disp = pd.DataFrame([disp]).T.reset_index()
+                df_disp.columns = ["Attribute", "Value"]
+                st.dataframe(df_disp, use_container_width=True, hide_index=True)
+            st.link_button("Open in Property Appraiser", pa_folio_url(folio))
+        else:
+            st.info("No property found for that folio in the Open Data layer. Double-check the 13-digit folio or open the Property Appraiser search.")
+    else:
+        st.caption("Enter a 13-digit folio in the sidebar to see property details here.")
+
+    
+    st.subheader("Lookup by Folio")
+    if folio:
+        prop = get_property_by_folio(folio)
+        if prop:
+            a = prop.get("attributes", {})
+            z = prop.get("zoning") or {}
+            # Compose owner lines
+            owners = ", ".join([x for x in [a.get("true_owner1"), a.get("true_owner2"), a.get("true_owner3"), a.get("true_owner4")] if x]) or "—"
+            mailing_bits = [a.get("mailing_address1"), a.get("mailing_address2"), a.get("mailing_city"), a.get("mailing_state"), a.get("mailing_zip")]
+            mailing = ", ".join([b for b in mailing_bits if b]) or "—"
+            # Basic facts
+            facts = {
+                "Folio": a.get("folio"),
+                "Subdivision": a.get("subdivision") or "—",
+                "Property Address": a.get("true_site_addr") or "—",
+                "City/ZIP": ", ".join([b for b in [a.get("true_site_city"), a.get("true_site_zip_code")] if b]) or "—",
+                "Owner(s)": owners,
+                "Mailing Address": mailing,
+                "PA Primary Zone": (z.get("ZONE") if z else a.get("pa_primary_zone")) or "—",
+                "Primary Land Use": a.get("dor_desc") or "—",
+                "Beds / Baths / Half": " / ".join([
+                    str(a.get("bedrooms")) if a.get("bedrooms") is not None else "-",
+                    str(a.get("bathrooms")) if a.get("bathrooms") is not None else "-",
+                    str(a.get("half_bath")) if a.get("half_bath") is not None else "-",
+                ]),
+                "Floors": a.get("stories") or a.get("floors") or "—",
+                "Living Units": a.get("num_units") or a.get("living_units") or "—",
+                "Actual Area": (f"{int(a.get('actual_area')):,} Sq.Ft" if a.get("actual_area") else "—"),
+                "Living Area": (f"{int(a.get('building_heated_area')):,} Sq.Ft" if a.get("building_heated_area") else (f"{int(a.get('living_area')):,} Sq.Ft" if a.get("living_area") else "—")),
+                "Adjusted Area": (f"{int(a.get('adjusted_area')):,} Sq.Ft" if a.get("adjusted_area") else "—"),
+                "Lot Size": (f"{int(a.get('lot_size')):,} Sq.Ft" if a.get("lot_size") else "—"),
+                "Year Built": a.get("year_built") or "—",
+            }
+            st.json(facts, expanded=False)
+            # Useful links
+            if a.get("folio"):
+                folio_link = f"{LINK_PROPERTY_APPRAISER}?searchOption=folio&searchValue={a.get('folio')}"
+                st.link_button("Open in Property Appraiser", folio_link)
+                st.link_button("Search Official Records (Clerk)", LINK_CLERK_OFFICIAL_RECORDS)
+        else:
+            st.warning("No property found for that folio. Make sure it's 13 digits (numbers only).")
+    else:
+        st.caption("Enter a folio number in the sidebar to fetch property details.")
+
     st.subheader("Property & Zoning at Location")
     if pt_latlon:
         z = get_zoning_at_point(lon=pt_latlon[1], lat=pt_latlon[0])
