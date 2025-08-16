@@ -1,7 +1,5 @@
-# ─────────────────────────────────────────────────────────────────────────────
 # app.py
 # Miami-Dade Property & Market Insights Dashboard (CSV export + Recent Sales)
-# ─────────────────────────────────────────────────────────────────────────────
 
 import json
 import requests
@@ -15,16 +13,13 @@ st.set_page_config(page_title="Miami-Dade Property & Market Insights", page_icon
 # ---------------------------
 # Endpoints
 # ---------------------------
-# Miami-Dade ArcGIS Feature Services (org id LBbVDC0hKPAnLRpO)
 MD_ZONING_FEATURESERVER = "https://services.arcgis.com/LBbVDC0hKPAnLRpO/ArcGIS/rest/services/Miami_Dade_Zoning_Phillips/FeatureServer"
-LAYER_MUNICIPAL_BOUNDARY = 4   # NAME field
-LAYER_ZONING = 12               # ZONE, ZONE_DESC fields
+LAYER_MUNICIPAL_BOUNDARY = 4
+LAYER_ZONING = 12
 
-# Property Appraiser GIS point view (Open Data Hub mirror)
 PA_GISVIEW_FEATURESERVER = "https://services.arcgis.com/8Pc9XBTAsYuxx9Ny/arcgis/rest/services/PaGISView_gdb/FeatureServer"
 LAYER_PROPERTY_POINT_VIEW = 0
 
-# Helpful external links
 LINK_PROPERTY_APPRAISER = "https://www.miamidade.gov/Apps/PA/propertysearch/"
 LINK_PROPERTY_APPRAISER_HELP = "https://www.miamidadepa.gov/pa/property-search-help.asp"
 LINK_CLERK_OFFICIAL_RECORDS = "https://onlineservices.miamidadeclerk.gov/officialrecords"
@@ -37,7 +32,6 @@ LINK_ECONOMIC_DASH = "https://www.miamidade.gov/global/economy/innovation-and-ec
 # ---------------------------
 @st.cache_data(show_spinner=False, ttl=60*60)
 def arcgis_query(service_url: str, layer: int, params: dict):
-    """Generic ArcGIS REST query → JSON dict or None (with friendly message)."""
     base = f"{service_url}/{layer}/query"
     defaults = {
         "f": "json",
@@ -133,17 +127,10 @@ def get_zones_in_polygon(rings):
     for f in data["features"]:
         a = f.get("attributes", {})
         rows.append({"ZONE": a.get("ZONE"), "ZONE_DESC": a.get("ZONE_DESC")})
-    return (
-        pd.DataFrame(rows)
-        .dropna()
-        .drop_duplicates()
-        .sort_values(by=["ZONE", "ZONE_DESC"])  # type: ignore
-        .reset_index(drop=True)
-    )
+    return pd.DataFrame(rows).dropna().drop_duplicates().sort_values(by=["ZONE", "ZONE_DESC"]).reset_index(drop=True)
 
 @st.cache_data(show_spinner=False, ttl=30*60)
 def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
-    """Recent sales (last N days) using Property Appraiser point view in polygon."""
     poly = {"rings": rings, "spatialReference": {"wkid": 4326}}
     where = f"dateofsale_utc >= CURRENT_TIMESTAMP - {int(days)}"
     params = {
@@ -162,7 +149,7 @@ def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
     }
     data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
     if not data or not data.get("features"):
-        return pd.DataFrame(columns=["folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"])  
+        return pd.DataFrame(columns=["folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"])
     rows = []
     for f in data["features"]:
         a = f.get("attributes", {})
@@ -202,7 +189,6 @@ with st.sidebar:
     st.markdown(f"- 🗺️ GIS Hub: [Open Data]({LINK_GIS_HUB})  ")
     st.markdown(f"- 📊 Econ & Planning: [Research Reports]({LINK_PLANNING_RESEARCH}) · [Metrics Dashboard]({LINK_ECONOMIC_DASH})  ")
 
-# Map + right panel
 col_map, col_info = st.columns([1.2, 0.8])
 
 with col_map:
@@ -255,7 +241,6 @@ with col_info:
     )
     st.markdown(f"**Clerk of Courts (Official Records):** <a href='{LINK_CLERK_OFFICIAL_RECORDS}' target='_blank'>Open search</a>", unsafe_allow_html=True)
 
-# Area-level tables + CSV downloads
 if selected_poly:
     st.markdown("---")
     st.subheader(f"Zoning mix in **{selected_muni}**")
@@ -298,108 +283,3 @@ with st.expander("📊 Planning, Research & Economic Analysis – quick links"):
     st.link_button("Planning & Research Reports", LINK_PLANNING_RESEARCH)
 
 st.caption("Data & sources: Miami-Dade Property Appraiser • Miami-Dade GIS Open Data Hub • Miami-Dade Clerk of Courts • Planning, Research & Economic Analysis. Unofficial convenience tool.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# requirements.txt
-# ─────────────────────────────────────────────────────────────────────────────
-# Place this content in requirements.txt at repo root
-# (Streamlit Cloud installs from here)
-
-# Web app & viz
-streamlit>=1.37,<2
-streamlit-folium>=0.20,<0.22
-folium>=0.15,<0.18
-
-# Data
-pandas>=2.0,<3
-requests>=2.32,<3
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# runtime.txt
-# ─────────────────────────────────────────────────────────────────────────────
-# Pin your Python for Streamlit Cloud
-python-3.11.9
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# .streamlit/config.toml
-# ─────────────────────────────────────────────────────────────────────────────
-# Create a folder named ".streamlit" at the repo root and put this file inside.
-
-[server]
-headless = true
-port = 8501
-enableCORS = false
-enableXsrfProtection = true
-
-[browser]
-gatherUsageStats = false
-
-[theme]
-primaryColor = "#0066CC"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F6F8FA"
-textColor = "#0F1419"
-font = "sans serif"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# .gitignore (optional but recommended)
-# ─────────────────────────────────────────────────────────────────────────────
-# Put this in a file named .gitignore at repo root
-__pycache__/
-.env
-.venv/
-.DS_Store
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# README.md
-# ─────────────────────────────────────────────────────────────────────────────
-# Minimal README with one-click instructions
-
-# Miami-Dade Property & Market Insights Dashboard
-
-Single-page Streamlit app that:
-- Selects a municipality and draws it on a map
-- Looks up **zoning** at any address you enter
-- Pulls **recent sales** (last N days) from the Property Appraiser point view for that area
-- Exports **Zoning** and **Recent Sales** tables to CSV
-
-## Run locally
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## Deploy on GitHub + Streamlit Cloud
-1) **Create a new GitHub repo** (e.g., `miamidade-dashboard`). Add these files at the repo root:
-- `app.py`
-- `requirements.txt`
-- `runtime.txt`
-- `.streamlit/config.toml` (create the `.streamlit/` folder and place `config.toml` inside)
-- `README.md`
-- `.gitignore` (optional)
-
-2) **Push to GitHub**
-```bash
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin https://github.com/<your-user>/miamidade-dashboard.git
-git push -u origin main
-```
-
-3) **Deploy on Streamlit Cloud**
-- Go to https://share.streamlit.io
-- Click **Deploy an app** → choose your repo
-- Set **Main file path** to `app.py`
-- Deploy (Streamlit Cloud will use `runtime.txt` and `requirements.txt` automatically)
-
-### Notes
-- No API keys are required. All data sources are public.
-- If a county ArcGIS layer is temporarily unavailable, the app shows a gentle message and continues running.
-- You can customize the UI theme in `.streamlit/config.toml`.
