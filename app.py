@@ -1,5 +1,9 @@
 # app.py
-# Miami-Dade Property & Market Insights Dashboard (CSV export + Recent Sales + Folio Lookup)
+# Miami-Dade Property & Market Insights Dashboard
+# - Folio lookup (MapServer first, FeatureServer fallback)
+# - Zoning mix by municipality
+# - Recent sales inside selected area
+# - CSV exports
 
 import json
 import requests
@@ -7,7 +11,7 @@ import pandas as pd
 import streamlit as st
 import folium
 
-# Safe import: streamlit-folium may not be installed in some environments
+# Safe import: streamlit-folium is optional
 try:
     from streamlit_folium import st_folium
 except ImportError:
@@ -16,12 +20,17 @@ except ImportError:
 st.set_page_config(page_title="Miami-Dade Property & Market Insights", page_icon="🏝️", layout="wide")
 
 # ---------------------------
-# Endpoints
+# Endpoints & Layers
 # ---------------------------
 MD_ZONING_FEATURESERVER = "https://services.arcgis.com/LBbVDC0hKPAnLRpO/ArcGIS/rest/services/Miami_Dade_Zoning_Phillips/FeatureServer"
 LAYER_MUNICIPAL_BOUNDARY = 4
 LAYER_ZONING = 12
 
+# County-run MapServer with explicit FOLIO schema (more reliable for folio lookups)
+PA_MAPSERVER = "https://gisweb.miamidade.gov/arcgis/rest/services/MD_Emaps/MapServer"
+LAYER_PROPERTY_RECORDS = 70  # has FOLIO + address/owner/areas/rooms
+
+# Hosted FeatureServer used for property point/sales queries
 PA_GISVIEW_FEATURESERVER = "https://services.arcgis.com/8Pc9XBTAsYuxx9Ny/arcgis/rest/services/PaGISView_gdb/FeatureServer"
 LAYER_PROPERTY_POINT_VIEW = 0
 
@@ -32,31 +41,29 @@ LINK_GIS_HUB = "https://gis-mdc.opendata.arcgis.com/"
 LINK_PLANNING_RESEARCH = "https://www.miamidade.gov/global/economy/planning/research-reports.page"
 LINK_ECONOMIC_DASH = "https://www.miamidade.gov/global/economy/innovation-and-economic-development/economic-metrics.page"
 
-# Direct link helper to open PA search prefilled by folio
+# ---------------------------
+# Helpers
+# ---------------------------
 
 def pa_folio_url(folio: str) -> str:
-    folio = (folio or "").strip().replace("-", "")
-    return f"https://www.miamidade.gov/Apps/PA/propertysearch/#/folio/{folio}" if folio else LINK_PROPERTY_APPRAISER
-
-# ---------------------------
-# Utilities
-# ---------------------------
+    digits = "".join(ch for ch in (folio or "") if ch.isdigit())
+    return f"https://www.miamidade.gov/Apps/PA/propertysearch/#/folio/{digits}" if digits else LINK_PROPERTY_APPRAISER
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def arcgis_query(service_url: str, layer: int, params: dict):
-    """Generic ArcGIS FeatureServer query with GET/POST auto-switch.
-    - Uses POST when geometry or long params (prevents 413).
-    - If returnGeometry is False, we omit outSR to avoid picky servers.
+    """Generic ArcGIS FeatureServer/MapServer query.
+    - Uses POST if geometry present or request is long (avoid 413)
+    - Only sets outSR when returnGeometry=True
+    - Returns parsed JSON or None and shows a friendly message
     """
     base = f"{service_url}/{layer}/query"
     defaults = {
         "f": "json",
-        "outFields": "*",
         "where": "1=1",
+        "outFields": "*",
         "returnGeometry": False,
     }
     q = {**defaults, **(params or {})}
-    # Only include outSR if we're actually returning geometry
     if q.get("returnGeometry"):
         q.setdefault("outSR", 4326)
     try:
@@ -68,70 +75,68 @@ def arcgis_query(service_url: str, layer: int, params: dict):
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict) and data.get("error"):
-            raise RuntimeError(str(data["error"]))
+            raise RuntimeError(data.get("error"))
         return data
     except Exception as e:
         st.info(f"ArcGIS query unavailable (layer {layer}). Details: {e}")
         return None
 
-# --- Geometry helpers (simplify big polygons to keep payloads small) ---
+# Geometry simplification (Douglas–Peucker) to keep payloads small
 
-def _rdp_simplify(points, eps):
-    """Douglas–Peucker on a single ring: list[(lon,lat)] → simplified ring."""
-    if len(points) < 3:
-        return points
+def _perp(p, a, b):
+    (x, y), (x1, y1), (x2, y2) = p, a, b
+    if (x1, y1) == (x2, y2):
+        return ((x-x1)**2 + (y-y1)**2) ** 0.5
+    t = ((x-x1)*(x2-x1) + (y-y1)*(y2-y1)) / ((x2-x1)**2 + (y2-y1)**2)
+    t = max(0.0, min(1.0, t))
+    proj = (x1 + t*(x2-x1), y1 + t*(y2-y1))
+    return ((x-proj[0])**2 + (y-proj[1])**2) ** 0.5
 
-    def _perp(p, a, b):
-        (x, y), (x1, y1), (x2, y2) = p, a, b
-        if (x1, y1) == (x2, y2):
-            return ((x-x1)**2 + (y-y1)**2) ** 0.5
-        t = ((x-x1)*(x2-x1) + (y-y1)*(y2-y1)) / ((x2-x1)**2 + (y2-y1)**2)
-        t = max(0.0, min(1.0, t))
-        proj = (x1 + t*(x2-x1), y1 + t*(y2-y1))
-        return ((x-proj[0])**2 + (y-proj[1])**2) ** 0.5
-
-    def _dp(pts):
-        if len(pts) <= 2:
-            return pts
-        a, b = pts[0], pts[-1]
-        dmax, idx = 0.0, -1
-        for i in range(1, len(pts)-1):
-            d = _perp(pts[i], a, b)
-            if d > dmax:
-                dmax, idx = d, i
-        if dmax > eps and idx != -1:
-            left = _dp(pts[:idx+1])
-            right = _dp(pts[idx:])
-            return left[:-1] + right
-        return [a, b]
-
-    closed = points[0] == points[-1]
-    core = points[:-1] if closed else points
-    simp = _dp(core)
-    if closed:
-        simp.append(simp[0])
-    return simp
+def _dp(pts, eps):
+    if len(pts) <= 2:
+        return pts
+    a, b = pts[0], pts[-1]
+    dmax, idx = 0.0, -1
+    for i in range(1, len(pts)-1):
+        d = _perp(pts[i], a, b)
+        if d > dmax:
+            dmax, idx = d, i
+    if dmax > eps and idx != -1:
+        left = _dp(pts[:idx+1], eps)
+        right = _dp(pts[idx:], eps)
+        return left[:-1] + right
+    return [a, b]
 
 def simplify_rings(rings, tolerance_meters=25):
     eps_deg = max(1e-6, tolerance_meters / 111_320.0)
-    return [_rdp_simplify(r, eps_deg) for r in rings]
+    out = []
+    for ring in rings:
+        closed = ring[0] == ring[-1]
+        core = ring[:-1] if closed else ring
+        simp = _dp(core, eps_deg)
+        if closed:
+            simp.append(simp[0])
+        out.append(simp)
+    return out
+
+# ---------------------------
+# Data accessors
+# ---------------------------
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def fetch_municipalities():
     data = arcgis_query(MD_ZONING_FEATURESERVER, LAYER_MUNICIPAL_BOUNDARY, {
-        "outFields": "NAME",
-        "returnGeometry": True,
+        "outFields": "NAME", "returnGeometry": True
     })
     items = []
-    if data and "features" in data:
+    if data and data.get("features"):
         for f in data["features"]:
-            attrs = f.get("attributes", {})
-            geom = f.get("geometry", {})
-            name = attrs.get("NAME") or attrs.get("Municipality") or attrs.get("municipality")
-            rings = (geom or {}).get("rings")
-            if not name or not rings:
-                continue
-            items.append({"name": name, "rings": [rings[0]]})
+            a = f.get("attributes", {})
+            g = f.get("geometry", {})
+            name = a.get("NAME") or a.get("Municipality") or a.get("municipality")
+            rings = (g or {}).get("rings")
+            if name and rings:
+                items.append({"name": name, "rings": [rings[0]]})
     return sorted(items, key=lambda x: x["name"]) if items else []
 
 @st.cache_data(show_spinner=False, ttl=60*60)
@@ -142,37 +147,31 @@ def geocode_address(addr: str):
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": addr, "format": "json", "limit": 1},
-            headers={"User-Agent": "mdc-dashboard/1.2 (Streamlit)"},
+            headers={"User-Agent": "mdc-dashboard/1.3 (Streamlit)"},
             timeout=20,
         )
         r.raise_for_status()
-        results = r.json() or []
-        if results:
-            return (float(results[0]["lat"]), float(results[0]["lon"]))
+        res = r.json() or []
+        if res:
+            return float(res[0]["lat"]), float(res[0]["lon"])
     except Exception:
         pass
     return None
 
-# ---------------------------
-# Data accessors
-# ---------------------------
-
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_layer_fields(service_url: str, layer: int):
-    """Fetch ArcGIS layer field metadata and return a dict keyed by lowercase name."""
     try:
         meta = requests.get(f"{service_url}/{layer}", params={"f": "json"}, timeout=20).json()
         fields = meta.get("fields", []) if isinstance(meta, dict) else []
-        return { (f.get("name") or "").lower(): f for f in fields }
+        return {(f.get("name") or "").lower(): f for f in fields}
     except Exception:
         return {}
 
-
 @st.cache_data(show_spinner=False, ttl=60*60)
-def get_property_by_folio(folio: str):
-    """Look up a property by folio using the actual field name discovered from layer metadata.
-    Tries equality on hyphenated + digits-only; then a digits LIKE fallback. Avoids SQL functions.
-    Returns {"attributes": {...}} or None.
+def get_property_by_folio(folio: str, prefer_mapserver: bool = True):
+    """Look up a property by folio.
+    A) Try county MapServer/70 (FOLIO) first; B) fall back to hosted FeatureServer/0.
+    Returns {"attributes": normalized_dict, "source": str, "where_used": str} or None.
     """
     if not folio:
         return None
@@ -185,170 +184,89 @@ def get_property_by_folio(folio: str):
 
     hyphenated = hyph(digits) if digits else raw
 
-    # Discover the folio field name (case/alias-proof)
-    fields_meta = get_layer_fields(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW)
-    folio_field = None
-    for cand in ["folio", "folio_num", "folio_nbr", "folioid", "folio_number", "md_folio"]:
-        if cand in fields_meta:
-            folio_field = fields_meta[cand]["name"]
-            break
-    if folio_field is None:
-        for k, v in fields_meta.items():
-            if "folio" in k:
-                folio_field = v.get("name")
-                break
-    folio_field = folio_field or "folio"
-
     def esc(s: str) -> str:
         return s.replace("'", "''")
 
-    wheres = []
-    if hyphenated:
-        wheres.append(f"{folio_field} = '{esc(hyphenated)}'")
-    if digits and len(digits) == 13:
-        wheres.append(f"{folio_field} = '{esc(digits)}'")
-        wheres.append(f"{folio_field} LIKE '%{esc(digits)}%'")
-
-    fields = [
-        "folio","true_site_addr","true_site_city","true_site_zip_code",
-        "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
-        "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
-        "pa_primary_zone","primarylanduse_desc","mailing_address1","mailing_address2","mailing_city","mailing_state","mailing_zip"
-    ]
-
-    for w in wheres:
-        params = {"where": w, "outFields": ",".join(fields), "returnGeometry": False}
-        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
-        feats = (data or {}).get("features", [])
-        if feats:
-            for f in feats:
-                a = f.get("attributes", {})
-                af = str(a.get("folio") or a.get(folio_field) or "")
-                if af and (af.replace("-", "") == digits or af == hyphenated):
-                    a["_where_used"] = w
-                    a["_folio_field"] = folio_field
-                    return {"attributes": a}
-            a = feats[0].get("attributes", {})
-            a["_where_used"] = w
-            a["_folio_field"] = folio_field
-            return {"attributes": a}
-
-    # Probe service health
-    probe = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, {"where": "1=1", "returnIdsOnly": True})
-    if not probe or not probe.get("objectIds"):
-        st.info("The Property Point layer is not returning IDs right now — the Open Data service may be down.")
-    return None
-
-    raw = str(folio).strip()
-    digits = "".join(ch for ch in raw if ch.isdigit())
-
-    def hyph(d: str) -> str:
-        return f"{d[0:2]}-{d[2:6]}-{d[6:9]}-{d[9:13]}" if len(d) == 13 else d
-
-    hyphenated = hyph(digits) if digits else raw
-
-    fields = [
-        "folio","true_site_addr","true_site_city","true_site_zip_code",
-        "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
-        "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
-        "pa_primary_zone","primarylanduse_desc","mailing_address1","mailing_address2","mailing_city","mailing_state","mailing_zip"
-    ]
-
-    # Escaper for single quotes
-    esc = lambda s: s.replace("'", "''")
-
-    wheres = []
-    # Try both field casings to be extra safe
-    for field in ("folio", "FOLIO"):
-        wheres.append(f"{field} = '{esc(hyphenated)}'")
-        if digits and len(digits) >= 6:
-            wheres.append(f"{field} LIKE '%{esc(digits)}%'")
-
-    tried = []
-    for w in wheres:
-        tried.append(w)
-        params = {
-            "where": w,
-            "outFields": ",".join(fields),
-            "returnGeometry": False,
-        }
-        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
-        feats = (data or {}).get("features", [])
-        if feats:
-            # pick the best match
-            for f in feats:
-                a = f.get("attributes", {})
-                af = str(a.get("folio") or a.get("FOLIO") or "")
-                if af and (af == hyphenated or af.replace("-", "") == digits):
-                    # Attach diagnostics for UI
-                    a["_where_used"] = w
-                    return {"attributes": a}
-            a = feats[0].get("attributes", {})
-            a["_where_used"] = w
-            return {"attributes": a}
-
-    # Final lightweight sanity probe to avoid false "no data" due to service issues
-    probe = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, {"where": "OBJECTID > 0", "returnIdsOnly": True})
-    if not probe or not probe.get("objectIds"):
-        st.info("Folio service probe returned no IDs. The Open Data service may be temporarily unavailable.")
-
-    return None
-# (Removed legacy duplicate folio lookup code block)
-    folio = "".join(ch for ch in folio if ch.isdigit())
-    if not folio:
+    def _query_mapserver70():
+        out_fields = ",".join([
+            "FOLIO","TRUE_SITE_ADDR","TRUE_SITE_CITY","TRUE_SITE_ZIP_CODE",
+            "TRUE_OWNER1","TRUE_OWNER2","DOR_DESC","SUBDIVISION","YEAR_BUILT","LOT_SIZE",
+            "BUILDING_ACTUAL_AREA","BUILDING_EFFECTIVE_AREA","BUILDING_GROSS_AREA",
+            "BEDROOM_COUNT","BATHROOM_COUNT","HALF_BATHROOM_COUNT","FLOOR_COUNT"
+        ])
+        wheres = []
+        if hyphenated: wheres.append(f"FOLIO = '{esc(hyphenated)}'")
+        if digits and len(digits) == 13:
+            wheres.append(f"FOLIO = '{esc(digits)}'")
+            wheres.append(f"FOLIO LIKE '%{esc(digits)}%'")
+        for w in wheres:
+            data = arcgis_query(PA_MAPSERVER, LAYER_PROPERTY_RECORDS, {
+                "where": w, "outFields": out_fields, "returnGeometry": False, "resultRecordCount": 5
+            })
+            feats = (data or {}).get("features", [])
+            if feats:
+                a = feats[0].get("attributes", {})
+                mapped = {
+                    "folio": a.get("FOLIO"),
+                    "true_site_addr": a.get("TRUE_SITE_ADDR"),
+                    "true_site_city": a.get("TRUE_SITE_CITY"),
+                    "true_site_zip_code": a.get("TRUE_SITE_ZIP_CODE"),
+                    "true_owner1": a.get("TRUE_OWNER1"),
+                    "true_owner2": a.get("TRUE_OWNER2"),
+                    "dor_desc": a.get("DOR_DESC"),
+                    "subdivision": a.get("SUBDIVISION"),
+                    "year_built": a.get("YEAR_BUILT"),
+                    "lot_size": a.get("LOT_SIZE"),
+                    "building_heated_area": a.get("BUILDING_EFFECTIVE_AREA") or a.get("BUILDING_ACTUAL_AREA"),
+                    "adjusted_area": a.get("BUILDING_EFFECTIVE_AREA"),
+                    "actual_area": a.get("BUILDING_ACTUAL_AREA"),
+                    "bedrooms": a.get("BEDROOM_COUNT"),
+                    "bathrooms": a.get("BATHROOM_COUNT"),
+                    "half_bathrooms": a.get("HALF_BATHROOM_COUNT"),
+                    "no_stories": a.get("FLOOR_COUNT"),
+                    "pa_primary_zone": None,
+                    "primarylanduse_desc": a.get("DOR_DESC"),
+                }
+                return {"attributes": mapped, "source": "MapServer/70", "where_used": w}
         return None
 
-    fields = [
-        "folio","true_site_addr","true_site_city","true_site_zip_code",
-        "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
-        "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
-        "pa_primary_zone","primarylanduse_desc","mailing_address1","mailing_address2","mailing_city","mailing_state","mailing_zip"
-    ]
+    def _query_featureserver0():
+        fields_meta = get_layer_fields(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW)
+        # discover folio field name
+        folio_field = None
+        for cand in ["folio","folio_num","folio_nbr","folioid","folio_number","md_folio"]:
+            if cand in fields_meta:
+                folio_field = fields_meta[cand]["name"]; break
+        if folio_field is None:
+            for k, v in fields_meta.items():
+                if "folio" in k:
+                    folio_field = v.get("name"); break
+        folio_field = folio_field or "folio"
 
-    wheres = [
-        f"folio = '{folio}'",
-        f"folio = {folio}",  # in case the service typed it numeric
-        f"folio LIKE '{folio}%'",
-        f"parent_folio = '{folio}'",
-    ]
+        out_fields = ",".join([
+            "folio","true_site_addr","true_site_city","true_site_zip_code",
+            "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
+            "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
+            "pa_primary_zone","primarylanduse_desc","mailing_address1","mailing_address2","mailing_city","mailing_state","mailing_zip"
+        ])
+        wheres = []
+        if hyphenated: wheres.append(f"{folio_field} = '{esc(hyphenated)}'")
+        if digits and len(digits) == 13:
+            wheres.append(f"{folio_field} = '{esc(digits)}'")
+            wheres.append(f"{folio_field} LIKE '%{esc(digits)}%'")
+        for w in wheres:
+            data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, {
+                "where": w, "outFields": out_fields, "returnGeometry": False, "resultRecordCount": 5
+            })
+            feats = (data or {}).get("features", [])
+            if feats:
+                a = feats[0].get("attributes", {})
+                return {"attributes": a, "source": "FeatureServer/0", "where_used": w}
+        return None
 
-    for w in wheres:
-        params = {
-            "where": w,
-            "outFields": ",".join(fields),
-            "returnGeometry": False,
-            "sqlFormat": "standard",
-        }
-        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
-        feats = (data or {}).get("features", [])
-        if feats:
-            # Prefer exact folio match
-            for f in feats:
-                a = f.get("attributes", {})
-                if str(a.get("folio", "")).replace("-", "") == folio:
-                    return {"attributes": a}
-            # else return first
-            return {"attributes": feats[0].get("attributes", {})}
-
-    # Try objectIds route as last resort
-    params_ids = {
-        "where": f"folio LIKE '{folio}%'",
-        "returnIdsOnly": True,
-    }
-    data_ids = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params_ids)
-    if data_ids and data_ids.get("objectIds"):
-        oid = data_ids["objectIds"][0]
-        params_oid = {
-            "objectIds": oid,
-            "outFields": ",".join(fields),
-            "returnGeometry": False,
-        }
-        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params_oid)
-        feats = (data or {}).get("features", [])
-        if feats:
-            return {"attributes": feats[0].get("attributes", {})}
-
-    return None
+    first = _query_mapserver70 if prefer_mapserver else _query_featureserver0
+    second = _query_featureserver0 if prefer_mapserver else _query_mapserver70
+    return first() or second()
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_zoning_at_point(lon: float, lat: float):
@@ -361,9 +279,9 @@ def get_zoning_at_point(lon: float, lat: float):
         "outFields": "ZONE,ZONE_DESC,OVLY,ZONEMUNC",
         "returnGeometry": False,
     })
-    if not data or not data.get("features"):
-        return None
-    return data["features"][0].get("attributes", {})
+    if data and data.get("features"):
+        return data["features"][0].get("attributes", {})
+    return None
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_zones_in_polygon(rings):
@@ -381,22 +299,21 @@ def get_zones_in_polygon(rings):
         "returnGeometry": False,
     })
     if not data or not data.get("features"):
-        return pd.DataFrame(columns=["ZONE", "ZONE_DESC"])
-    rows = [{"ZONE": f.get("attributes", {}).get("ZONE"),
-             "ZONE_DESC": f.get("attributes", {}).get("ZONE_DESC")} for f in data["features"]]
-    return pd.DataFrame(rows).dropna().drop_duplicates().sort_values(by=["ZONE", "ZONE_DESC"]).reset_index(drop=True)
+        return pd.DataFrame(columns=["ZONE","ZONE_DESC"])
+    rows = []
+    for f in data["features"]:
+        a = f.get("attributes", {})
+        rows.append({"ZONE": a.get("ZONE"), "ZONE_DESC": a.get("ZONE_DESC")})
+    return pd.DataFrame(rows).dropna().drop_duplicates().sort_values(by=["ZONE","ZONE_DESC"]).reset_index(drop=True)
 
 @st.cache_data(show_spinner=False, ttl=30*60)
 def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
-    """Fetch recent sales by polygon with pagination; filter by date client-side."""
-    def _paged_query(base_params, step=2000, hard_cap=max_rows):
-        rows = []
-        offset = 0
-        while True:
-            if len(rows) >= hard_cap:
-                break
+    """Recent sales inside polygon using FeatureServer/0; paginate + client-side date filter."""
+    def _paged(base_params, step=2000, cap=max_rows):
+        rows, offset = [], 0
+        while len(rows) < cap:
             params = dict(base_params)
-            params["resultRecordCount"] = min(step, hard_cap - len(rows))
+            params["resultRecordCount"] = min(step, cap - len(rows))
             params["resultOffset"] = offset
             data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
             feats = (data or {}).get("features", [])
@@ -413,7 +330,7 @@ def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
         use_rings = simplify_rings(rings, tolerance_meters=25)
     poly = {"rings": use_rings, "spatialReference": {"wkid": 4326}}
 
-    base_params = {
+    base = {
         "geometry": json.dumps(poly),
         "geometryType": "esriGeometryPolygon",
         "inSR": 4326,
@@ -426,14 +343,14 @@ def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
         "geometryPrecision": 6,
     }
 
-    attrs = _paged_query(base_params)
+    attrs = _paged(base)
     if not attrs:
         return pd.DataFrame(columns=["folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"]) 
 
     df = pd.DataFrame(attrs)
 
-    # Detect and parse sale date
-    candidate_cols = ["dateofsale_utc", "dateofsale", "sale_date", "last_sale_date", "date_of_sale", "saledate"]
+    # Detect & parse sale date
+    candidate_cols = ["dateofsale_utc","dateofsale","sale_date","last_sale_date","date_of_sale","saledate"]
     date_col = next((c for c in candidate_cols if c in df.columns), None)
     if date_col:
         s = df[date_col]
@@ -497,8 +414,7 @@ with col_map:
         match = next((it for it in muni_items if it["name"] == selected_muni), None)
         if match:
             selected_poly = match["rings"]
-            folium.Polygon(locations=[(lat, lon) for lon, lat in match["rings"][0]],
-                           tooltip=selected_muni, weight=2, fill=False).add_to(m)
+            folium.Polygon(locations=[(lat, lon) for lon, lat in match["rings"][0]], tooltip=selected_muni, weight=2, fill=False).add_to(m)
             lats = [lat for lon, lat in match["rings"][0]]
             lons = [lon for lon, lat in match["rings"][0]]
             m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
@@ -521,39 +437,45 @@ with col_map:
 # --- Info column ---
 with col_info:
     st.subheader("Property by Folio")
+
+    src_choice = st.radio(
+        "Data source for folio lookup",
+        ["MapServer first (recommended)", "FeatureServer first (fallback)"],
+        horizontal=True,
+        index=0,
+        help="If you still see 400 errors, switch and compare diagnostics below.",
+    )
+    prefer_mapserver = (src_choice == "MapServer first (recommended)")
+
     if folio:
-        prop = get_property_by_folio(folio)
-        if prop:
-            a = prop.get("attributes", {})
-            # Top line
-            st.success(f"Folio: {a.get('folio') or a.get('FOLIO') or ''}")
+        result = get_property_by_folio(folio, prefer_mapserver=prefer_mapserver)
+        if result:
+            a = result["attributes"]
+            st.success(f"Folio: {a.get('folio') or ''}")
             # Address & owners
-            addr_line = a.get('true_site_addr') or a.get('TRUE_SITE_ADDR') or ''
-            city_zip = " ".join([str(a.get('true_site_city') or a.get('TRUE_SITE_CITY') or ''), str(a.get('true_site_zip_code') or a.get('TRUE_SITE_ZIP_CODE') or '')]).strip()
-            owner1 = a.get('true_owner1') or a.get('TRUE_OWNER1') or ''
-            owner2 = a.get('true_owner2') or a.get('TRUE_OWNER2') or ''
+            addr_line = a.get('true_site_addr') or ''
+            city_zip = " ".join([str(a.get('true_site_city') or ''), str(a.get('true_site_zip_code') or '')]).strip()
+            owner1 = a.get('true_owner1') or ''
+            owner2 = a.get('true_owner2') or ''
             c1, c2 = st.columns(2)
             with c1:
-                if addr_line:
-                    st.markdown(f"**Property Address:** {addr_line}")
-                if city_zip:
-                    st.markdown(city_zip)
+                if addr_line: st.markdown(f"**Property Address:** {addr_line}")
+                if city_zip:  st.markdown(city_zip)
             with c2:
                 owners = "<br/>".join([x for x in [owner1, owner2] if x])
                 if owners:
                     st.markdown("**Owner(s):**  ")
                     st.markdown(owners, unsafe_allow_html=True)
-            # Zoning/Use
-            pa_zone = a.get('pa_primary_zone') or a.get('PA_PRIMARY_ZONE')
-            use_desc = a.get('primarylanduse_desc') or a.get('PRIMARYLANDUSE_DESC') or a.get('dor_desc') or a.get('DOR_DESC')
-            subdiv = a.get('subdivision') or a.get('SUBDIVISION')
+            # Use & zoning labels (if available)
+            pa_zone = a.get('pa_primary_zone')
+            use_desc = a.get('primarylanduse_desc') or a.get('dor_desc')
+            subdiv = a.get('subdivision')
             parts = []
-            if pa_zone: parts.append(f"**PA Primary Zone:** {pa_zone}")
+            if pa_zone:  parts.append(f"**PA Primary Zone:** {pa_zone}")
             if use_desc: parts.append(f"**Primary Land Use:** {use_desc}")
-            if subdiv: parts.append(f"**Subdivision:** {subdiv}")
-            if parts:
-                st.markdown("  • ".join(parts))
-            # Building details
+            if subdiv:   parts.append(f"**Subdivision:** {subdiv}")
+            if parts:    st.markdown("  • ".join(parts))
+            # Building details table
             kmap = {
                 "bedrooms": "Beds",
                 "bathrooms": "Baths",
@@ -566,18 +488,18 @@ with col_info:
                 "lot_size": "Lot Size (SqFt)",
                 "year_built": "Year Built",
             }
-            # support uppercase variants just in case
-            a_norm = {**{k.lower(): v for k, v in a.items()}}
-            disp = {v: a_norm.get(k) for k, v in kmap.items() if a_norm.get(k) is not None}
+            disp = {v: a.get(k) for k, v in kmap.items() if a.get(k) is not None}
             if disp:
                 df_disp = pd.DataFrame([disp]).T.reset_index()
                 df_disp.columns = ["Attribute", "Value"]
                 st.dataframe(df_disp, use_container_width=True, hide_index=True)
-            st.link_button("Open in Property Appraiser", pa_folio_url(folio))
+
+            st.link_button("Open in Property Appraiser (Folio tab)", pa_folio_url(a.get('folio') or folio))
+
             with st.expander("Folio lookup diagnostics"):
-                st.code(a.get('_where_used', '—'))
+                st.write({"source": result.get("source"), "where_used": result.get("where_used")})
         else:
-            st.info("No property found for that folio in the Open Data layer. Double-check the 13-digit folio or open the Property Appraiser search.")
+            st.info("No property found for that folio via the selected source(s). Try the other source above, or open the Property Appraiser link.")
     else:
         st.caption("Enter a 13-digit folio in the sidebar to see property details here.")
 
@@ -619,10 +541,7 @@ if selected_poly:
     st.subheader(f"Recent sales in **{selected_muni}** (last {sales_window} days)")
     with st.expander("Diagnostics (service + query)"):
         st.caption("If results look empty, check the counts below to confirm live data.")
-        st.write({
-            "rings_vertices": sum(len(r) for r in selected_poly),
-            "sales_window_days": int(sales_window),
-        })
+        st.write({"rings_vertices": sum(len(r) for r in selected_poly), "sales_window_days": int(sales_window)})
     df_sales = get_recent_sales_in_polygon(selected_poly, days=sales_window)
     if not df_sales.empty:
         show_cols = {
@@ -645,7 +564,7 @@ if selected_poly:
         st.download_button("⬇️ Download recent sales (CSV)", data=csv_sales, file_name=f"{selected_muni}_recent_sales_{sales_window}d.csv", mime="text/csv")
         st.caption("Source: Miami-Dade Property Point View (PaGISView_gdb)")
     else:
-        st.warning("No recent sales returned. This can happen if the service is caching, date math differs, or the area/time window has few records. Try increasing days or toggling the municipality.")
+        st.warning("No recent sales returned. This can happen if the service is caching, date math differs, or the area/time window has few records. Try increasing days or changing the municipality.")
 
 with st.expander("📊 Planning, Research & Economic Analysis – quick links"):
     st.write("Use these official dashboards and PDFs for countywide labor market, GDP, and office market context.")
@@ -653,37 +572,3 @@ with st.expander("📊 Planning, Research & Economic Analysis – quick links"):
     st.link_button("Planning & Research Reports", LINK_PLANNING_RESEARCH)
 
 st.caption("Data & sources: Miami-Dade Property Appraiser • Miami-Dade GIS Open Data Hub • Miami-Dade Clerk of Courts • Planning, Research & Economic Analysis. Unofficial convenience tool.")
-
-# ---------------------------
-# (Repo files below — copy each to its own file at repo root)
-# ---------------------------
-
-# requirements.txt (create this file at repo root)
-# -----------------------------------------------
-# streamlit==1.37.1
-# streamlit-folium==0.20.0
-# folium==0.17.0
-# pandas==2.2.2
-# requests==2.32.3
-
-# runtime.txt (create this file at repo root)
-# ------------------------------------------
-# python-3.11.9
-
-# .streamlit/config.toml (make a folder named .streamlit and put this inside)
-# -----------------------------------------------------
-# [server]
-# headless = true
-# port = 8501
-# enableCORS = false
-# enableXsrfProtection = true
-#
-# [browser]
-# gatherUsageStats = false
-#
-# [theme]
-# primaryColor = "#0066CC"
-# backgroundColor = "#FFFFFF"
-# secondaryBackgroundColor = "#F6F8FA"
-# textColor = "#0F1419"
-# font = "sans serif"
