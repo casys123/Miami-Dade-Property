@@ -363,8 +363,6 @@ if selected_poly:
         st.caption("Source: Miami-Dade Property Point View (PaGISView_gdb)")
     else:
         st.warning("No recent sales returned. This can happen if the service is caching, date math differs, or the area/time window has few records. Try increasing days or toggling the municipality.")
-    else:
-        st.info("No recent sales found for this area in the selected window (or service busy). Try a larger range.")
 
 with st.expander("📊 Planning, Research & Economic Analysis – quick links"):
     st.write("Use these official dashboards and PDFs for countywide labor market, GDP, and office market context.")
