@@ -159,11 +159,68 @@ def geocode_address(addr: str):
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_property_by_folio(folio: str):
-    """Return a dict with attributes for a folio from PA GIS view.
-    This tries multiple *string* WHERE patterns (no numeric casts) to avoid 400 errors.
+    """Look up a property by folio using simple, standardized WHERE clauses.
+    Tries hyphenated equality first, then a digits LIKE fallback. Avoids SQL functions.
+    Returns {"attributes": {...}} or None.
     """
     if not folio:
         return None
+
+    raw = str(folio).strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+
+    def hyph(d: str) -> str:
+        return f"{d[0:2]}-{d[2:6]}-{d[6:9]}-{d[9:13]}" if len(d) == 13 else d
+
+    hyphenated = hyph(digits) if digits else raw
+
+    fields = [
+        "folio","true_site_addr","true_site_city","true_site_zip_code",
+        "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
+        "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
+        "pa_primary_zone","primarylanduse_desc","mailing_address1","mailing_address2","mailing_city","mailing_state","mailing_zip"
+    ]
+
+    # Escaper for single quotes
+    esc = lambda s: s.replace("'", "''")
+
+    wheres = []
+    # Try both field casings to be extra safe
+    for field in ("folio", "FOLIO"):
+        wheres.append(f"{field} = '{esc(hyphenated)}'")
+        if digits and len(digits) >= 6:
+            wheres.append(f"{field} LIKE '%{esc(digits)}%'")
+
+    tried = []
+    for w in wheres:
+        tried.append(w)
+        params = {
+            "where": w,
+            "outFields": ",".join(fields),
+            "returnGeometry": False,
+        }
+        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
+        feats = (data or {}).get("features", [])
+        if feats:
+            # pick the best match
+            for f in feats:
+                a = f.get("attributes", {})
+                af = str(a.get("folio") or a.get("FOLIO") or "")
+                if af and (af == hyphenated or af.replace("-", "") == digits):
+                    # Attach diagnostics for UI
+                    a["_where_used"] = w
+                    return {"attributes": a}
+            a = feats[0].get("attributes", {})
+            a["_where_used"] = w
+            return {"attributes": a}
+
+    # Final lightweight sanity probe to avoid false "no data" due to service issues
+    probe = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, {"where": "OBJECTID > 0", "returnIdsOnly": True})
+    if not probe or not probe.get("objectIds"):
+        st.info("Folio service probe returned no IDs. The Open Data service may be temporarily unavailable.")
+
+    return None
+
 
     folio_raw = str(folio).strip()
     folio_digits = "".join(ch for ch in folio_raw if ch.isdigit())
@@ -466,12 +523,12 @@ with col_info:
         if prop:
             a = prop.get("attributes", {})
             # Top line
-            st.success(f"Folio: {a.get('folio','')}")
+            st.success(f"Folio: {a.get('folio') or a.get('FOLIO') or ''}")
             # Address & owners
-            addr_line = a.get('true_site_addr') or ''
-            city_zip = " ".join([str(a.get('true_site_city') or ''), str(a.get('true_site_zip_code') or '')]).strip()
-            owner1 = a.get('true_owner1') or ''
-            owner2 = a.get('true_owner2') or ''
+            addr_line = a.get('true_site_addr') or a.get('TRUE_SITE_ADDR') or ''
+            city_zip = " ".join([str(a.get('true_site_city') or a.get('TRUE_SITE_CITY') or ''), str(a.get('true_site_zip_code') or a.get('TRUE_SITE_ZIP_CODE') or '')]).strip()
+            owner1 = a.get('true_owner1') or a.get('TRUE_OWNER1') or ''
+            owner2 = a.get('true_owner2') or a.get('TRUE_OWNER2') or ''
             c1, c2 = st.columns(2)
             with c1:
                 if addr_line:
@@ -484,9 +541,9 @@ with col_info:
                     st.markdown("**Owner(s):**  ")
                     st.markdown(owners, unsafe_allow_html=True)
             # Zoning/Use
-            pa_zone = a.get('pa_primary_zone')
-            use_desc = a.get('primarylanduse_desc') or a.get('dor_desc')
-            subdiv = a.get('subdivision')
+            pa_zone = a.get('pa_primary_zone') or a.get('PA_PRIMARY_ZONE')
+            use_desc = a.get('primarylanduse_desc') or a.get('PRIMARYLANDUSE_DESC') or a.get('dor_desc') or a.get('DOR_DESC')
+            subdiv = a.get('subdivision') or a.get('SUBDIVISION')
             parts = []
             if pa_zone: parts.append(f"**PA Primary Zone:** {pa_zone}")
             if use_desc: parts.append(f"**Primary Land Use:** {use_desc}")
@@ -506,12 +563,16 @@ with col_info:
                 "lot_size": "Lot Size (SqFt)",
                 "year_built": "Year Built",
             }
-            disp = {v: a.get(k) for k, v in kmap.items() if a.get(k) is not None}
+            # support uppercase variants just in case
+            a_norm = {**{k.lower(): v for k, v in a.items()}}
+            disp = {v: a_norm.get(k) for k, v in kmap.items() if a_norm.get(k) is not None}
             if disp:
                 df_disp = pd.DataFrame([disp]).T.reset_index()
                 df_disp.columns = ["Attribute", "Value"]
                 st.dataframe(df_disp, use_container_width=True, hide_index=True)
             st.link_button("Open in Property Appraiser", pa_folio_url(folio))
+            with st.expander("Folio lookup diagnostics"):
+                st.code(a.get('_where_used', '—'))
         else:
             st.info("No property found for that folio in the Open Data layer. Double-check the 13-digit folio or open the Property Appraiser search.")
     else:
