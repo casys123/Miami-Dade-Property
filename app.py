@@ -198,7 +198,8 @@ def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
     if sum(len(r) for r in rings) > 1500:
         use_rings = simplify_rings(rings, tolerance_meters=25)
     poly = {"rings": use_rings, "spatialReference": {"wkid": 4326}}
-    where = f"dateofsale_utc >= CURRENT_TIMESTAMP - {int(days)}"
+    # Use DATEADD for ArcGIS Server date math (more reliable than CURRENT_TIMESTAMP - N)
+    where = f"dateofsale_utc >= DATEADD(day, -{int(days)}, CURRENT_TIMESTAMP)"
     params = {
         "geometry": json.dumps(poly),
         "geometryType": "esriGeometryPolygon",
@@ -215,6 +216,11 @@ def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
         "geometryPrecision": 6,
     }
     data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
+    # Fallback: if zero features (service-side date math differences), try without date filter then filter client-side
+    if (not data) or (not data.get("features")):
+        params_fallback = params.copy()
+        params_fallback.pop("where", None)
+        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params_fallback)
     if not data or not data.get("features"):
         return pd.DataFrame(columns=["folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"])
     rows = []
@@ -224,10 +230,15 @@ def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
             "folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"
         ]})
     df = pd.DataFrame(rows)
+    # Clean types
     if "dateofsale_utc" in df.columns:
         df["dateofsale_utc"] = pd.to_datetime(df["dateofsale_utc"], errors="coerce")
     if "price_1" in df.columns:
         df["price_1"] = pd.to_numeric(df["price_1"], errors="coerce")
+    # Client-side date filter if needed
+    if days and "dateofsale_utc" in df.columns:
+        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=int(days))
+        df = df[df["dateofsale_utc"] >= cutoff]
     return df.sort_values("dateofsale_utc", ascending=False).reset_index(drop=True)
 
 # ---------------------------
@@ -323,6 +334,12 @@ if selected_poly:
         st.info("Zoning summary not available right now.")
 
     st.subheader(f"Recent sales in **{selected_muni}** (last {sales_window} days)")
+    with st.expander("Diagnostics (service + query)"):
+        st.caption("If results look empty, check the counts below to confirm live data.")
+        st.write({
+            "rings_vertices": sum(len(r) for r in selected_poly),
+            "sales_window_days": int(sales_window),
+        })
     df_sales = get_recent_sales_in_polygon(selected_poly, days=sales_window)
     if not df_sales.empty:
         show_cols = {
@@ -344,6 +361,8 @@ if selected_poly:
         csv_sales = df_show.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Download recent sales (CSV)", data=csv_sales, file_name=f"{selected_muni}_recent_sales_{sales_window}d.csv", mime="text/csv")
         st.caption("Source: Miami-Dade Property Point View (PaGISView_gdb)")
+    else:
+        st.warning("No recent sales returned. This can happen if the service is caching, date math differs, or the area/time window has few records. Try increasing days or toggling the municipality.")
     else:
         st.info("No recent sales found for this area in the selected window (or service busy). Try a larger range.")
 
