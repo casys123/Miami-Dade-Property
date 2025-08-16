@@ -35,6 +35,53 @@ LINK_ECONOMIC_DASH = "https://www.miamidade.gov/global/economy/innovation-and-ec
 # ---------------------------
 # Utilities
 # ---------------------------
+
+def _rdp_simplify(points, eps):
+    """Douglas–Peucker polyline simplification for a ring (list of (lon,lat)).
+    eps is tolerance in degrees (~ meters/111_320)."""
+    if len(points) < 3:
+        return points
+    # perpendicular distance from point p to line ab
+    def _perp(p, a, b):
+        (x, y), (x1, y1), (x2, y2) = p, a, b
+        if (x1, y1) == (x2, y2):
+            return ((x-x1)**2 + (y-y1)**2) ** 0.5
+        t = ((x-x1)*(x2-x1) + (y-y1)*(y2-y1)) / ((x2-x1)**2 + (y2-y1)**2)
+        t = max(0.0, min(1.0, t))
+        proj = (x1 + t*(x2-x1), y1 + t*(y2-y1))
+        return ((x-proj[0])**2 + (y-proj[1])**2) ** 0.5
+    # recursive DP
+    def _dp(pts):
+        if len(pts) <= 2:
+            return pts
+        a, b = pts[0], pts[-1]
+        dmax, idx = 0.0, -1
+        for i in range(1, len(pts)-1):
+            d = _perp(pts[i], a, b)
+            if d > dmax:
+                dmax, idx = d, i
+        if dmax > eps and idx != -1:
+            left = _dp(pts[:idx+1])
+            right = _dp(pts[idx:])
+            return left[:-1] + right
+        else:
+            return [a, b]
+    # Ensure closed ring (repeat first point at end)
+    closed = points[0] == points[-1]
+    core = points[:-1] if closed else points
+    simp = _dp(core)
+    if closed:
+        simp.append(simp[0])
+    return simp
+
+def simplify_rings(rings, tolerance_meters=20):
+    """Return simplified rings using a Douglas–Peucker tolerance in meters."""
+    # crude deg per meter conversion near Miami (~ 1 deg lat ≈ 111_320 m)
+    eps_deg = max(1e-6, tolerance_meters / 111_320.0)
+    out = []
+    for ring in rings:
+        out.append(_rdp_simplify(ring, eps_deg))
+    return out
 @st.cache_data(show_spinner=False, ttl=60*60)
 def arcgis_query(service_url: str, layer: int, params: dict):
     base = f"{service_url}/{layer}/query"
@@ -121,7 +168,12 @@ def get_zoning_at_point(lon: float, lat: float):
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_zones_in_polygon(rings):
-    poly = {"rings": rings, "spatialReference": {"wkid": 4326}}
+    # Proactively simplify large polygons to avoid 413 on ArcGIS (URL/body too big)
+    orig_len = sum(len(r) for r in rings)
+    use_rings = rings
+    if orig_len > 1500:
+        use_rings = simplify_rings(rings, tolerance_meters=25)
+    poly = {"rings": use_rings, "spatialReference": {"wkid": 4326}}
     data = arcgis_query(MD_ZONING_FEATURESERVER, LAYER_ZONING, {
         "geometry": json.dumps(poly),
         "geometryType": "esriGeometryPolygon",
@@ -141,7 +193,11 @@ def get_zones_in_polygon(rings):
 
 @st.cache_data(show_spinner=False, ttl=30*60)
 def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
-    poly = {"rings": rings, "spatialReference": {"wkid": 4326}}
+    # Simplify if huge polygon
+    use_rings = rings
+    if sum(len(r) for r in rings) > 1500:
+        use_rings = simplify_rings(rings, tolerance_meters=25)
+    poly = {"rings": use_rings, "spatialReference": {"wkid": 4326}}
     where = f"dateofsale_utc >= CURRENT_TIMESTAMP - {int(days)}"
     params = {
         "geometry": json.dumps(poly),
@@ -156,7 +212,7 @@ def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
         "returnGeometry": False,
         "orderByFields": "dateofsale_utc DESC",
         "resultRecordCount": max_rows,
-        "geometryPrecision": 6,  # shrink payload
+        "geometryPrecision": 6,
     }
     data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
     if not data or not data.get("features"):
