@@ -5,8 +5,13 @@ import json
 import requests
 import pandas as pd
 import streamlit as st
-from streamlit_folium import st_folium
 import folium
+
+# Safe import: streamlit-folium may not be installed in some environments
+try:
+    from streamlit_folium import st_folium
+except ImportError:
+    st_folium = None
 
 st.set_page_config(page_title="Miami-Dade Property & Market Insights", page_icon="🏝️", layout="wide")
 
@@ -215,7 +220,10 @@ with col_map:
                 m.location = [loc[0], loc[1]]
                 m.zoom_start = 15
 
-    st_folium(m, width=None, height=600)
+    if st_folium:
+        st_folium(m, width=None, height=600)
+    else:
+        st.warning("streamlit-folium not installed. Map preview disabled. Please add 'streamlit-folium' to requirements.txt.")
 
 with col_info:
     st.subheader("Property & Zoning at Location")
