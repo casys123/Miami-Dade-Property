@@ -47,7 +47,12 @@ def arcgis_query(service_url: str, layer: int, params: dict):
     }
     q = {**defaults, **(params or {})}
     try:
-        r = requests.get(base, params=q, timeout=25)
+        # Use POST when geometry is present or URL would be too long to avoid 413 errors
+        use_post = ("geometry" in q) or (len(base) + len(str(q)) > 1800)
+        if use_post:
+            r = requests.post(base, data=q, timeout=30, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        else:
+            r = requests.get(base, params=q, timeout=25)
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict) and data.get("error"):
@@ -151,6 +156,7 @@ def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
         "returnGeometry": False,
         "orderByFields": "dateofsale_utc DESC",
         "resultRecordCount": max_rows,
+        "geometryPrecision": 6,  # shrink payload
     }
     data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
     if not data or not data.get("features"):
