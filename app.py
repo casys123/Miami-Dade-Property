@@ -10,6 +10,7 @@ import requests
 import pandas as pd
 import streamlit as st
 import folium
+import time
 
 # Safe import: streamlit-folium is optional
 try:
@@ -134,6 +135,28 @@ def simplify_rings(rings, tolerance_meters=25):
 # ---------------------------
 # Data accessors
 # ---------------------------
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def normalize_folios(text: str):
+    """Parse newline/CSV/space-separated folios; return list of (hyphenated, digits)."""
+    if not text:
+        return []
+    raw_tokens = [tok.strip() for tok in (
+        text.replace("
+", "
+").replace(",", "
+").split("
+")
+    ) if tok.strip()]
+    seen = set(); out = []
+    for tok in raw_tokens:
+        hyph, digits = format_md_folio(tok)
+        key = digits or hyph
+        if key and key not in seen:
+            seen.add(key)
+            out.append((hyph, digits))
+    return out
+
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def fetch_municipalities():
@@ -278,7 +301,51 @@ def get_property_by_folio(folio: str, prefer_mapserver: bool = True):
 
     first = _query_mapserver70 if prefer_mapserver else _query_featureserver0
     second = _query_featureserver0 if prefer_mapserver else _query_mapserver70
-    return first() or second()
+        return first() or second()
+
+@st.cache_data(show_spinner=False, ttl=30*60)
+def bulk_properties_by_folios(folio_list, prefer_mapserver: bool = True, sleep_sec: float = 0.15):
+    """Lookup many folios and return a DataFrame of normalized export rows with status.
+    folio_list: iterable of folio strings (hyphenated or digits)."""
+    rows = []
+    for idx, fol in enumerate(folio_list, start=1):
+        hyph, digits = format_md_folio(fol)
+        try:
+            res = get_property_by_folio(hyph or digits, prefer_mapserver=prefer_mapserver)
+            if res and res.get("attributes"):
+                a = res["attributes"]
+                rows.append({
+                    "Folio": a.get('folio') or hyph or digits,
+                    "Property Address": a.get('true_site_addr'),
+                    "City": a.get('true_site_city'),
+                    "ZIP": a.get('true_site_zip_code'),
+                    "Owner 1": a.get('true_owner1'),
+                    "Owner 2": a.get('true_owner2'),
+                    "Subdivision": a.get('subdivision'),
+                    "Primary Land Use": a.get('primarylanduse_desc') or a.get('dor_desc'),
+                    "PA Primary Zone": a.get('pa_primary_zone'),
+                    "Beds": a.get('bedrooms'),
+                    "Baths": a.get('bathrooms'),
+                    "Half Baths": a.get('half_bathrooms'),
+                    "Floors": a.get('no_stories'),
+                    "Living Units": a.get('living_units'),
+                    "Actual Area (SqFt)": a.get('actual_area'),
+                    "Living Area (SqFt)": a.get('building_heated_area'),
+                    "Adjusted Area (SqFt)": a.get('adjusted_area'),
+                    "Lot Size (SqFt)": a.get('lot_size'),
+                    "Year Built": a.get('year_built'),
+                    "PA Folio URL": pa_folio_url(a.get('folio') or hyph or digits),
+                    "Source": res.get("source"),
+                    "Query": res.get("where_used"),
+                    "Status": "OK",
+                })
+            else:
+                rows.append({"Folio": hyph or digits, "Status": "NOT FOUND"})
+        except Exception as e:
+            rows.append({"Folio": hyph or digits, "Status": f"ERROR: {e}"})
+        time.sleep(max(0.0, sleep_sec))
+    return pd.DataFrame(rows)
+
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_zoning_at_point(lon: float, lat: float):
@@ -546,8 +613,56 @@ with col_info:
                 file_name=f"property_{''.join(ch for ch in (a.get('folio') or folio) if ch.isdigit())}.csv",
                 mime="text/csv",
             )
+
+            # --- Bulk export UI ---
+            st.markdown("---")
+            st.markdown("### Bulk folio lookup & export")
+            st.caption("Paste multiple folios (digits or hyphenated), one-per-line or separated by commas. Or upload a CSV with a column named 'folio'.")
+            bulk_text = st.text_area("Paste folios here", height=120, placeholder="3530070191100
+0131234567890
+01-2345-678-9012, 1133260050000")
+            upload = st.file_uploader("…or upload a CSV with a 'folio' column", type=["csv"]) 
+
+            input_folios = []
+            if bulk_text:
+                input_folios.extend([x[0] or x[1] for x in normalize_folios(bulk_text)])
+            if upload is not None:
+                try:
+                    df_up = pd.read_csv(upload)
+                    if 'folio' in df_up.columns:
+                        for v in df_up['folio'].astype(str).tolist():
+                            h,d = format_md_folio(v)
+                            input_folios.append(h or d)
+                except Exception as e:
+                    st.error(f"Could not read CSV: {e}")
+
+            input_folios = [f for f in input_folios if f]
+            if input_folios:
+                st.write(f"Detected **{len(input_folios)}** folio(s). Duplicates will be ignored in results.")
+                if st.button("Run bulk lookup"):
+                    with st.spinner("Fetching properties…"):
+                        df_bulk = bulk_properties_by_folios(input_folios, prefer_mapserver=prefer_mapserver)
+                    if not df_bulk.empty:
+                        # drop duplicate rows by Folio keeping first OK
+                        if 'Folio' in df_bulk.columns:
+                            df_bulk = df_bulk.drop_duplicates(subset=['Folio'], keep='first')
+                        st.dataframe(df_bulk, use_container_width=True)
+                        csv_bulk = df_bulk.to_csv(index=False).encode('utf-8')
+                        st.download_button("⬇️ Download bulk results (CSV)", data=csv_bulk, file_name="mdc_properties_bulk.csv", mime="text/csv")
+                    else:
+                        st.info("No results returned for the provided folios.")
+            else:
+                st.caption("Provide folios above to enable bulk lookup.")
+
         else:
-            st.info("No property found for that folio via the selected source(s). Try the other source above, or open the Property Appraiser link."))
+            st.info("No property found for that folio via the selected source(s). Try the other source above, or open the Property Appraiser link.")
+                "⬇️ Download this property (CSV)",
+                data=csv_prop,
+                file_name=f"property_{''.join(ch for ch in (a.get('folio') or folio) if ch.isdigit())}.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No property found for that folio via the selected source(s). Try the other source above, or open the Property Appraiser link.")
     else:
         st.caption("Enter a 13-digit folio in the sidebar to see property details here.")
 
