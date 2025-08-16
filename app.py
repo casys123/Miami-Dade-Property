@@ -44,16 +44,21 @@ def pa_folio_url(folio: str) -> str:
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def arcgis_query(service_url: str, layer: int, params: dict):
-    """Generic ArcGIS FeatureServer query with GET/POST auto-switch to avoid 413s."""
+    """Generic ArcGIS FeatureServer query with GET/POST auto-switch.
+    - Uses POST when geometry or long params (prevents 413).
+    - If returnGeometry is False, we omit outSR to avoid picky servers.
+    """
     base = f"{service_url}/{layer}/query"
     defaults = {
         "f": "json",
         "outFields": "*",
         "where": "1=1",
-        "returnGeometry": True,
-        "outSR": 4326,
+        "returnGeometry": False,
     }
     q = {**defaults, **(params or {})}
+    # Only include outSR if we're actually returning geometry
+    if q.get("returnGeometry"):
+        q.setdefault("outSR", 4326)
     try:
         use_post = ("geometry" in q) or (len(base) + len(str(q)) > 1800)
         if use_post:
@@ -154,30 +159,64 @@ def geocode_address(addr: str):
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_property_by_folio(folio: str):
-    """Return a dict with attributes/geometry for a folio from PA GIS view."""
+    """Return a dict with attributes for a folio from PA GIS view (robust 'where' fallbacks)."""
     if not folio:
         return None
     folio = "".join(ch for ch in folio if ch.isdigit())
     if not folio:
         return None
-    params = {
-        "where": f"folio = '{folio}'",
-        "outFields": ",".join([
-            "folio","true_site_addr","true_site_city","true_site_zip_code",
-            "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
-            "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
-            "pa_primary_zone","primarylanduse_desc","mailing_address1","mailing_address2","mailing_city","mailing_state","mailing_zip"
-        ]),
-        "returnGeometry": True,
+
+    fields = [
+        "folio","true_site_addr","true_site_city","true_site_zip_code",
+        "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
+        "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
+        "pa_primary_zone","primarylanduse_desc","mailing_address1","mailing_address2","mailing_city","mailing_state","mailing_zip"
+    ]
+
+    wheres = [
+        f"folio = '{folio}'",
+        f"folio = {folio}",  # in case the service typed it numeric
+        f"folio LIKE '{folio}%'",
+        f"parent_folio = '{folio}'",
+    ]
+
+    for w in wheres:
+        params = {
+            "where": w,
+            "outFields": ",".join(fields),
+            "returnGeometry": False,
+            "sqlFormat": "standard",
+        }
+        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
+        feats = (data or {}).get("features", [])
+        if feats:
+            # Prefer exact folio match
+            for f in feats:
+                a = f.get("attributes", {})
+                if str(a.get("folio", "")).replace("-", "") == folio:
+                    return {"attributes": a}
+            # else return first
+            return {"attributes": feats[0].get("attributes", {})}
+
+    # Try objectIds route as last resort
+    params_ids = {
+        "where": f"folio LIKE '{folio}%'",
+        "returnIdsOnly": True,
     }
-    data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
-    feats = (data or {}).get("features", [])
-    if not feats:
-        return None
-    feat = feats[0]
-    attrs = feat.get("attributes", {})
-    geom = feat.get("geometry") or {}
-    return {"attributes": attrs, "geometry": geom}
+    data_ids = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params_ids)
+    if data_ids and data_ids.get("objectIds"):
+        oid = data_ids["objectIds"][0]
+        params_oid = {
+            "objectIds": oid,
+            "outFields": ",".join(fields),
+            "returnGeometry": False,
+        }
+        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params_oid)
+        feats = (data or {}).get("features", [])
+        if feats:
+            return {"attributes": feats[0].get("attributes", {})}
+
+    return None
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_zoning_at_point(lon: float, lat: float):
