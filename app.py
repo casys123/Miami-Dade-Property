@@ -1,0 +1,405 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# app.py
+# Miami-Dade Property & Market Insights Dashboard (CSV export + Recent Sales)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import json
+import requests
+import pandas as pd
+import streamlit as st
+from streamlit_folium import st_folium
+import folium
+
+st.set_page_config(page_title="Miami-Dade Property & Market Insights", page_icon="🏝️", layout="wide")
+
+# ---------------------------
+# Endpoints
+# ---------------------------
+# Miami-Dade ArcGIS Feature Services (org id LBbVDC0hKPAnLRpO)
+MD_ZONING_FEATURESERVER = "https://services.arcgis.com/LBbVDC0hKPAnLRpO/ArcGIS/rest/services/Miami_Dade_Zoning_Phillips/FeatureServer"
+LAYER_MUNICIPAL_BOUNDARY = 4   # NAME field
+LAYER_ZONING = 12               # ZONE, ZONE_DESC fields
+
+# Property Appraiser GIS point view (Open Data Hub mirror)
+PA_GISVIEW_FEATURESERVER = "https://services.arcgis.com/8Pc9XBTAsYuxx9Ny/arcgis/rest/services/PaGISView_gdb/FeatureServer"
+LAYER_PROPERTY_POINT_VIEW = 0
+
+# Helpful external links
+LINK_PROPERTY_APPRAISER = "https://www.miamidade.gov/Apps/PA/propertysearch/"
+LINK_PROPERTY_APPRAISER_HELP = "https://www.miamidadepa.gov/pa/property-search-help.asp"
+LINK_CLERK_OFFICIAL_RECORDS = "https://onlineservices.miamidadeclerk.gov/officialrecords"
+LINK_GIS_HUB = "https://gis-mdc.opendata.arcgis.com/"
+LINK_PLANNING_RESEARCH = "https://www.miamidade.gov/global/economy/planning/research-reports.page"
+LINK_ECONOMIC_DASH = "https://www.miamidade.gov/global/economy/innovation-and-economic-development/economic-metrics.page"
+
+# ---------------------------
+# Utilities
+# ---------------------------
+@st.cache_data(show_spinner=False, ttl=60*60)
+def arcgis_query(service_url: str, layer: int, params: dict):
+    """Generic ArcGIS REST query → JSON dict or None (with friendly message)."""
+    base = f"{service_url}/{layer}/query"
+    defaults = {
+        "f": "json",
+        "outFields": "*",
+        "where": "1=1",
+        "returnGeometry": True,
+        "outSR": 4326,
+    }
+    q = {**defaults, **(params or {})}
+    try:
+        r = requests.get(base, params=q, timeout=25)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        return data
+    except Exception as e:
+        st.info(f"ArcGIS query unavailable (layer {layer}). Details: {e}")
+        return None
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def fetch_municipalities():
+    data = arcgis_query(MD_ZONING_FEATURESERVER, LAYER_MUNICIPAL_BOUNDARY, {
+        "outFields": "NAME",
+        "returnGeometry": True,
+    })
+    items = []
+    if data and "features" in data:
+        for f in data["features"]:
+            attrs = f.get("attributes", {})
+            geom = f.get("geometry", {})
+            name = attrs.get("NAME") or attrs.get("Municipality") or attrs.get("municipality")
+            if not name:
+                continue
+            rings = geom.get("rings")
+            if not rings:
+                continue
+            first_poly = rings[0]
+            items.append({"name": name, "rings": [first_poly]})
+    return sorted(items, key=lambda x: x["name"]) if items else []
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def geocode_address(addr: str):
+    if not addr:
+        return None
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": addr, "format": "json", "limit": 1},
+            headers={"User-Agent": "mdc-dashboard/1.1 (Streamlit)"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        results = r.json()
+        if results:
+            lat = float(results[0]["lat"])
+            lon = float(results[0]["lon"])
+            return (lat, lon)
+        return None
+    except Exception:
+        return None
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def get_zoning_at_point(lon: float, lat: float):
+    geom = {"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}
+    data = arcgis_query(MD_ZONING_FEATURESERVER, LAYER_ZONING, {
+        "geometry": json.dumps(geom),
+        "geometryType": "esriGeometryPoint",
+        "inSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "ZONE,ZONE_DESC,OVLY,ZONEMUNC",
+        "returnGeometry": False,
+    })
+    if not data or not data.get("features"):
+        return None
+    return data["features"][0].get("attributes", {})
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def get_zones_in_polygon(rings):
+    poly = {"rings": rings, "spatialReference": {"wkid": 4326}}
+    data = arcgis_query(MD_ZONING_FEATURESERVER, LAYER_ZONING, {
+        "geometry": json.dumps(poly),
+        "geometryType": "esriGeometryPolygon",
+        "inSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "ZONE,ZONE_DESC",
+        "returnDistinctValues": True,
+        "returnGeometry": False,
+    })
+    if not data or not data.get("features"):
+        return pd.DataFrame(columns=["ZONE", "ZONE_DESC"])
+    rows = []
+    for f in data["features"]:
+        a = f.get("attributes", {})
+        rows.append({"ZONE": a.get("ZONE"), "ZONE_DESC": a.get("ZONE_DESC")})
+    return (
+        pd.DataFrame(rows)
+        .dropna()
+        .drop_duplicates()
+        .sort_values(by=["ZONE", "ZONE_DESC"])  # type: ignore
+        .reset_index(drop=True)
+    )
+
+@st.cache_data(show_spinner=False, ttl=30*60)
+def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
+    """Recent sales (last N days) using Property Appraiser point view in polygon."""
+    poly = {"rings": rings, "spatialReference": {"wkid": 4326}}
+    where = f"dateofsale_utc >= CURRENT_TIMESTAMP - {int(days)}"
+    params = {
+        "geometry": json.dumps(poly),
+        "geometryType": "esriGeometryPolygon",
+        "inSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "where": where,
+        "outFields": ",".join([
+            "folio","true_site_addr","true_site_city","true_site_zip_code",
+            "true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"
+        ]),
+        "returnGeometry": False,
+        "orderByFields": "dateofsale_utc DESC",
+        "resultRecordCount": max_rows,
+    }
+    data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
+    if not data or not data.get("features"):
+        return pd.DataFrame(columns=["folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"])  
+    rows = []
+    for f in data["features"]:
+        a = f.get("attributes", {})
+        rows.append({k: a.get(k) for k in [
+            "folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"
+        ]})
+    df = pd.DataFrame(rows)
+    if "dateofsale_utc" in df.columns:
+        df["dateofsale_utc"] = pd.to_datetime(df["dateofsale_utc"], errors="coerce")
+    if "price_1" in df.columns:
+        df["price_1"] = pd.to_numeric(df["price_1"], errors="coerce")
+    return df.sort_values("dateofsale_utc", ascending=False).reset_index(drop=True)
+
+# ---------------------------
+# UI
+# ---------------------------
+st.title("🏝️ Miami-Dade Property & Market Insights")
+st.caption("Powered by Miami-Dade County Open Data & official portals.")
+
+with st.sidebar:
+    st.header("Filters")
+    muni_items = fetch_municipalities()
+    muni_names = [it["name"] for it in muni_items] if muni_items else []
+    selected_muni = st.selectbox("Select Municipality / Area", options=["(none)"] + muni_names, index=0)
+
+    st.markdown("**Look up specific properties** (opens official sites in a new tab):")
+    addr = st.text_input("Address (for map & Property Appraiser link)")
+    owner = st.text_input("Owner Name (for Property Appraiser & Clerk search)")
+    folio = st.text_input("Folio Number (13 digits)")
+
+    st.markdown("**Recent Sales Window**")
+    sales_window = st.slider("Days back", min_value=7, max_value=365, value=90, step=7)
+
+    st.markdown("---")
+    st.markdown(f"- 📍 Property Appraiser: [Search app]({LINK_PROPERTY_APPRAISER})  ")
+    st.markdown(f"- 📄 Clerk: [Official Records]({LINK_CLERK_OFFICIAL_RECORDS})  ")
+    st.markdown(f"- 🗺️ GIS Hub: [Open Data]({LINK_GIS_HUB})  ")
+    st.markdown(f"- 📊 Econ & Planning: [Research Reports]({LINK_PLANNING_RESEARCH}) · [Metrics Dashboard]({LINK_ECONOMIC_DASH})  ")
+
+# Map + right panel
+col_map, col_info = st.columns([1.2, 0.8])
+
+with col_map:
+    m = folium.Map(location=[25.774, -80.193], zoom_start=10, control_scale=True)
+
+    selected_poly = None
+    if selected_muni != "(none)" and muni_items:
+        match = next((it for it in muni_items if it["name"] == selected_muni), None)
+        if match:
+            selected_poly = match["rings"]
+            folium.Polygon(locations=[(lat, lon) for lon, lat in match["rings"][0]],
+                           tooltip=selected_muni, weight=2, fill=False).add_to(m)
+            lats = [lat for lon, lat in match["rings"][0]]
+            lons = [lon for lon, lat in match["rings"][0]]
+            m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
+
+    pt_latlon = None
+    if addr:
+        loc = geocode_address(addr)
+        if loc:
+            pt_latlon = loc
+            folium.Marker(location=[loc[0], loc[1]], tooltip=addr).add_to(m)
+            if not selected_poly:
+                m.location = [loc[0], loc[1]]
+                m.zoom_start = 15
+
+    st_folium(m, width=None, height=600)
+
+with col_info:
+    st.subheader("Property & Zoning at Location")
+    if pt_latlon:
+        z = get_zoning_at_point(lon=pt_latlon[1], lat=pt_latlon[0])
+        if z:
+            st.success(
+                f"**Zoning:** {z.get('ZONE')}  " +
+                (f"*{z.get('ZONE_DESC')}*  " if z.get('ZONE_DESC') else "")+
+                (f"**Overlay:** {z.get('OVLY')}  " if z.get('OVLY') else "")+
+                (f"**Jurisdiction:** {z.get('ZONEMUNC')}" if z.get('ZONEMUNC') else "")
+            )
+        else:
+            st.info("No zoning polygon found at this point (or service busy). Try moving the point or selecting a municipality.")
+    else:
+        st.caption("Enter an address in the sidebar to see zoning at that point.")
+
+    st.subheader("Official Lookups")
+    st.markdown(
+        f"**Property Appraiser:** <a href='{LINK_PROPERTY_APPRAISER}' target='_blank'>Open search</a><br/>"
+        f"<small>Use tabs to search by Address, Owner, or Folio. See <a href='{LINK_PROPERTY_APPRAISER_HELP}' target='_blank'>help</a>.</small>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"**Clerk of Courts (Official Records):** <a href='{LINK_CLERK_OFFICIAL_RECORDS}' target='_blank'>Open search</a>", unsafe_allow_html=True)
+
+# Area-level tables + CSV downloads
+if selected_poly:
+    st.markdown("---")
+    st.subheader(f"Zoning mix in **{selected_muni}**")
+    df_z = get_zones_in_polygon(selected_poly)
+    if not df_z.empty:
+        st.dataframe(df_z, use_container_width=True, hide_index=True)
+        csv_z = df_z.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download zoning table (CSV)", data=csv_z, file_name=f"{selected_muni}_zoning.csv", mime="text/csv")
+    else:
+        st.info("Zoning summary not available right now.")
+
+    st.subheader(f"Recent sales in **{selected_muni}** (last {sales_window} days)")
+    df_sales = get_recent_sales_in_polygon(selected_poly, days=sales_window)
+    if not df_sales.empty:
+        show_cols = {
+            "dateofsale_utc": "Sale Date",
+            "price_1": "Price",
+            "true_site_addr": "Address",
+            "true_site_city": "City",
+            "true_site_zip_code": "ZIP",
+            "dor_desc": "Land Use",
+            "subdivision": "Subdivision",
+            "year_built": "Year Built",
+            "lot_size": "Lot SqFt",
+            "building_heated_area": "Heated SqFt",
+            "true_owner1": "Owner",
+            "folio": "Folio",
+        }
+        df_show = df_sales.rename(columns=show_cols)
+        st.dataframe(df_show, use_container_width=True)
+        csv_sales = df_show.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download recent sales (CSV)", data=csv_sales, file_name=f"{selected_muni}_recent_sales_{sales_window}d.csv", mime="text/csv")
+        st.caption("Source: Miami-Dade Property Point View (PaGISView_gdb)")
+    else:
+        st.info("No recent sales found for this area in the selected window (or service busy). Try a larger range.")
+
+with st.expander("📊 Planning, Research & Economic Analysis – quick links"):
+    st.write("Use these official dashboards and PDFs for countywide labor market, GDP, and office market context.")
+    st.link_button("Open Economic Metrics Dashboard", LINK_ECONOMIC_DASH)
+    st.link_button("Planning & Research Reports", LINK_PLANNING_RESEARCH)
+
+st.caption("Data & sources: Miami-Dade Property Appraiser • Miami-Dade GIS Open Data Hub • Miami-Dade Clerk of Courts • Planning, Research & Economic Analysis. Unofficial convenience tool.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+# Place this content in requirements.txt at repo root
+# (Streamlit Cloud installs from here)
+
+# Web app & viz
+streamlit>=1.37,<2
+streamlit-folium>=0.20,<0.22
+folium>=0.15,<0.18
+
+# Data
+pandas>=2.0,<3
+requests>=2.32,<3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# runtime.txt
+# ─────────────────────────────────────────────────────────────────────────────
+# Pin your Python for Streamlit Cloud
+python-3.11.9
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# .streamlit/config.toml
+# ─────────────────────────────────────────────────────────────────────────────
+# Create a folder named ".streamlit" at the repo root and put this file inside.
+
+[server]
+headless = true
+port = 8501
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+primaryColor = "#0066CC"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F6F8FA"
+textColor = "#0F1419"
+font = "sans serif"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# .gitignore (optional but recommended)
+# ─────────────────────────────────────────────────────────────────────────────
+# Put this in a file named .gitignore at repo root
+__pycache__/
+.env
+.venv/
+.DS_Store
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# README.md
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimal README with one-click instructions
+
+# Miami-Dade Property & Market Insights Dashboard
+
+Single-page Streamlit app that:
+- Selects a municipality and draws it on a map
+- Looks up **zoning** at any address you enter
+- Pulls **recent sales** (last N days) from the Property Appraiser point view for that area
+- Exports **Zoning** and **Recent Sales** tables to CSV
+
+## Run locally
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Deploy on GitHub + Streamlit Cloud
+1) **Create a new GitHub repo** (e.g., `miamidade-dashboard`). Add these files at the repo root:
+- `app.py`
+- `requirements.txt`
+- `runtime.txt`
+- `.streamlit/config.toml` (create the `.streamlit/` folder and place `config.toml` inside)
+- `README.md`
+- `.gitignore` (optional)
+
+2) **Push to GitHub**
+```bash
+git init
+git add .
+git commit -m "Initial commit"
+git branch -M main
+git remote add origin https://github.com/<your-user>/miamidade-dashboard.git
+git push -u origin main
+```
+
+3) **Deploy on Streamlit Cloud**
+- Go to https://share.streamlit.io
+- Click **Deploy an app** → choose your repo
+- Set **Main file path** to `app.py`
+- Deploy (Streamlit Cloud will use `runtime.txt` and `requirements.txt` automatically)
+
+### Notes
+- No API keys are required. All data sources are public.
+- If a county ArcGIS layer is temporarily unavailable, the app shows a gentle message and continues running.
+- You can customize the UI theme in `.streamlit/config.toml`.
