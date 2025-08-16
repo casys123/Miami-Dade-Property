@@ -192,74 +192,103 @@ def get_zones_in_polygon(rings):
     return pd.DataFrame(rows).dropna().drop_duplicates().sort_values(by=["ZONE", "ZONE_DESC"]).reset_index(drop=True)
 
 @st.cache_data(show_spinner=False, ttl=30*60)
-def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 3000):
+def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
     """Recent sales inside polygon.
-    NOTE: We fetch most-recent records server-side (spatial + orderBy) and filter by date client-side.
-    This avoids ArcGIS 'where' issues when the date field is stored as epoch millis.
+    Strategy:
+      1) Spatial filter by polygon (POST)
+      2) Pull up to `max_rows` with pagination (no fragile server-side date WHERE)
+      3) Auto-detect a sale date field (prefers 'dateofsale_utc') and filter client-side
     """
-    # Simplify if huge polygon to avoid 413s
+    # --- Helper: paginate ArcGIS queries ---
+    def _paged_query(base_params, step=2000, hard_cap=max_rows):
+        rows = []
+        offset = 0
+        while True:
+            params = dict(base_params)
+            params["resultRecordCount"] = min(step, hard_cap - len(rows))
+            params["resultOffset"] = offset
+            data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
+            feats = (data or {}).get("features", [])
+            if not feats:
+                break
+            for f in feats:
+                rows.append(f.get("attributes", {}))
+            if len(rows) >= hard_cap or len(feats) < params["resultRecordCount"]:
+                break
+            offset += params["resultRecordCount"]
+        return rows
+
+    # --- Simplify polygon if huge to avoid 413s ---
     use_rings = rings
     if sum(len(r) for r in rings) > 1500:
         use_rings = simplify_rings(rings, tolerance_meters=25)
-
     poly = {"rings": use_rings, "spatialReference": {"wkid": 4326}}
 
-    params = {
+    base_params = {
         "geometry": json.dumps(poly),
         "geometryType": "esriGeometryPolygon",
         "inSR": 4326,
         "spatialRel": "esriSpatialRelIntersects",
-        # No server-side WHERE on date (field may be epoch ms); we'll filter locally
         "outFields": ",".join([
             "folio","true_site_addr","true_site_city","true_site_zip_code",
             "true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"
         ]),
         "returnGeometry": False,
-        "orderByFields": "dateofsale_utc DESC",
-        "resultRecordCount": max_rows,
+        # Avoid relying on a specific field name for ordering
+        # We'll sort locally after parsing dates
         "geometryPrecision": 6,
     }
 
-    data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
-    if not data or not data.get("features"):
+    attrs = _paged_query(base_params)
+    if not attrs:
         return pd.DataFrame(columns=["folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"]) 
 
-    rows = []
-    for f in data["features"]:
-        a = f.get("attributes", {})
-        rows.append({k: a.get(k) for k in [
-            "folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"
-        ]})
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(attrs)
 
-    # Normalize sale date
-    if "dateofsale_utc" in df.columns:
-        s = df["dateofsale_utc"]
-        # If numeric -> epoch millis
+    # --- Pick a sale date column robustly ---
+    candidate_cols = [
+        "dateofsale_utc", "dateofsale", "sale_date", "last_sale_date", "date_of_sale", "saledate"
+    ]
+    date_col = next((c for c in candidate_cols if c in df.columns), None)
+    if date_col is None:
+        # fallback: heuristic - first column that contains both 'date' and 'sale'
+        for c in df.columns:
+            lc = c.lower()
+            if "date" in lc and "sale" in lc:
+                date_col = c
+                break
+    # Parse dates if we found any
+    if date_col:
+        s = df[date_col]
         if pd.api.types.is_numeric_dtype(s):
-            dt = pd.to_datetime(s, unit="ms", utc=True, errors="coerce")
+            df[date_col] = pd.to_datetime(s, unit="ms", utc=True, errors="coerce")
         else:
-            dt = pd.to_datetime(s, utc=True, errors="coerce")
-        df["dateofsale_utc"] = dt
+            df[date_col] = pd.to_datetime(s, utc=True, errors="coerce")
+        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(days))
+        df = df[df[date_col] >= cutoff]
+        # Rename to common name for UI
+        if date_col != "dateofsale_utc":
+            df.rename(columns={date_col: "dateofsale_utc"}, inplace=True)
+    else:
+        # No date field detected; skip date filtering
+        pass
 
     # Normalize price
     if "price_1" in df.columns:
         df["price_1"] = pd.to_numeric(df["price_1"], errors="coerce")
 
-    # Client-side filter by days
-    if days and "dateofsale_utc" in df.columns:
-        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(days))
-        mask = df["dateofsale_utc"] >= cutoff
-        df = df[mask]
-
-    # Make display a bit friendlier (drop tz info)
+    # Friendly display date (drop tz)
     if "dateofsale_utc" in df.columns:
         try:
-            df["dateofsale_utc"] = df["dateofsale_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
+            df["dateofsale_utc"] = pd.to_datetime(df["dateofsale_utc"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
         except Exception:
             pass
 
-    return df.sort_values("dateofsale_utc", ascending=False).reset_index(drop=True)
+    # Sort newest first if we have the date
+    if "dateofsale_utc" in df.columns:
+        df = df.sort_values("dateofsale_utc", ascending=False)
+
+    return df.reset_index(drop=True)
 
 # ---------------------------
 # UI
