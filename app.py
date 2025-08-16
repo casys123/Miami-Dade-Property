@@ -159,9 +159,81 @@ def geocode_address(addr: str):
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_property_by_folio(folio: str):
-    """Return a dict with attributes for a folio from PA GIS view (robust 'where' fallbacks)."""
+    """Return a dict with attributes for a folio from PA GIS view.
+    This tries multiple *string* WHERE patterns (no numeric casts) to avoid 400 errors.
+    """
     if not folio:
         return None
+
+    folio_raw = str(folio).strip()
+    folio_digits = "".join(ch for ch in folio_raw if ch.isdigit())
+
+    def fmt_md_folio(digits: str) -> str:
+        # Miami‑Dade folio: 13 digits -> 2-4-3-4
+        if len(digits) == 13:
+            return f"{digits[0:2]}-{digits[2:6]}-{digits[6:9]}-{digits[9:13]}"
+        return digits
+
+    folio_hyph = fmt_md_folio(folio_digits) if folio_digits else folio_raw
+
+    fields = [
+        "folio","true_site_addr","true_site_city","true_site_zip_code",
+        "true_owner1","true_owner2","dor_desc","subdivision","year_built","lot_size",
+        "building_heated_area","adjusted_area","actual_area","living_units","bedrooms","bathrooms","half_bathrooms","no_stories",
+        "pa_primary_zone","primarylanduse_desc","mailing_address1","mailing_address2","mailing_city","mailing_state","mailing_zip"
+    ]
+
+    # Escape single quotes for ArcGIS SQL
+    def esc(s: str) -> str:
+        return s.replace("'", "''")
+
+    candidates = [v for v in [folio_hyph, folio_raw, folio_digits] if v]
+
+    wheres = []
+    for v in candidates:
+        vq = esc(v)
+        wheres.append(f"folio = '{vq}'")
+        wheres.append(f"UPPER(folio) = UPPER('{vq}')")
+    # fuzzy fallback on digits if we have them
+    if folio_digits:
+        wheres.append(f"folio LIKE '%{esc(folio_digits)}%'")
+        wheres.append(f"parent_folio = '{esc(folio_hyph)}'")
+
+    for w in wheres:
+        params = {
+            "where": w,
+            "outFields": ",".join(fields),
+            "returnGeometry": False,
+            "sqlFormat": "standard",
+        }
+        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
+        feats = (data or {}).get("features", [])
+        if feats:
+            # Prefer exact hyphenated match if present
+            for f in feats:
+                a = f.get("attributes", {})
+                afolio = str(a.get("folio", "") or "").strip()
+                if afolio and (afolio == folio_hyph or afolio.replace("-", "") == folio_digits):
+                    return {"attributes": a}
+            return {"attributes": feats[0].get("attributes", {})}
+
+    # As a last resort, try objectIds route with a broad LIKE only if digits exist
+    if folio_digits:
+        params_ids = {"where": f"folio LIKE '%{esc(folio_digits)}%'", "returnIdsOnly": True}
+        data_ids = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params_ids)
+        if data_ids and data_ids.get("objectIds"):
+            oid = data_ids["objectIds"][0]
+            params_oid = {
+                "objectIds": oid,
+                "outFields": ",".join(fields),
+                "returnGeometry": False,
+            }
+            data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params_oid)
+            feats = (data or {}).get("features", [])
+            if feats:
+                return {"attributes": feats[0].get("attributes", {})}
+
+    return None
     folio = "".join(ch for ch in folio if ch.isdigit())
     if not folio:
         return None
