@@ -192,20 +192,24 @@ def get_zones_in_polygon(rings):
     return pd.DataFrame(rows).dropna().drop_duplicates().sort_values(by=["ZONE", "ZONE_DESC"]).reset_index(drop=True)
 
 @st.cache_data(show_spinner=False, ttl=30*60)
-def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
-    # Simplify if huge polygon
+def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 3000):
+    """Recent sales inside polygon.
+    NOTE: We fetch most-recent records server-side (spatial + orderBy) and filter by date client-side.
+    This avoids ArcGIS 'where' issues when the date field is stored as epoch millis.
+    """
+    # Simplify if huge polygon to avoid 413s
     use_rings = rings
     if sum(len(r) for r in rings) > 1500:
         use_rings = simplify_rings(rings, tolerance_meters=25)
+
     poly = {"rings": use_rings, "spatialReference": {"wkid": 4326}}
-    # Use DATEADD for ArcGIS Server date math (more reliable than CURRENT_TIMESTAMP - N)
-    where = f"dateofsale_utc >= DATEADD(day, -{int(days)}, CURRENT_TIMESTAMP)"
+
     params = {
         "geometry": json.dumps(poly),
         "geometryType": "esriGeometryPolygon",
         "inSR": 4326,
         "spatialRel": "esriSpatialRelIntersects",
-        "where": where,
+        # No server-side WHERE on date (field may be epoch ms); we'll filter locally
         "outFields": ",".join([
             "folio","true_site_addr","true_site_city","true_site_zip_code",
             "true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"
@@ -215,14 +219,11 @@ def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
         "resultRecordCount": max_rows,
         "geometryPrecision": 6,
     }
+
     data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params)
-    # Fallback: if zero features (service-side date math differences), try without date filter then filter client-side
-    if (not data) or (not data.get("features")):
-        params_fallback = params.copy()
-        params_fallback.pop("where", None)
-        data = arcgis_query(PA_GISVIEW_FEATURESERVER, LAYER_PROPERTY_POINT_VIEW, params_fallback)
     if not data or not data.get("features"):
-        return pd.DataFrame(columns=["folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"])
+        return pd.DataFrame(columns=["folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"]) 
+
     rows = []
     for f in data["features"]:
         a = f.get("attributes", {})
@@ -230,15 +231,34 @@ def get_recent_sales_in_polygon(rings, days:int=90, max_rows:int=2000):
             "folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"
         ]})
     df = pd.DataFrame(rows)
-    # Clean types
+
+    # Normalize sale date
     if "dateofsale_utc" in df.columns:
-        df["dateofsale_utc"] = pd.to_datetime(df["dateofsale_utc"], errors="coerce")
+        s = df["dateofsale_utc"]
+        # If numeric -> epoch millis
+        if pd.api.types.is_numeric_dtype(s):
+            dt = pd.to_datetime(s, unit="ms", utc=True, errors="coerce")
+        else:
+            dt = pd.to_datetime(s, utc=True, errors="coerce")
+        df["dateofsale_utc"] = dt
+
+    # Normalize price
     if "price_1" in df.columns:
         df["price_1"] = pd.to_numeric(df["price_1"], errors="coerce")
-    # Client-side date filter if needed
+
+    # Client-side filter by days
     if days and "dateofsale_utc" in df.columns:
-        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=int(days))
-        df = df[df["dateofsale_utc"] >= cutoff]
+        cutoff = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=int(days))
+        mask = df["dateofsale_utc"] >= cutoff
+        df = df[mask]
+
+    # Make display a bit friendlier (drop tz info)
+    if "dateofsale_utc" in df.columns:
+        try:
+            df["dateofsale_utc"] = df["dateofsale_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
+        except Exception:
+            pass
+
     return df.sort_values("dateofsale_utc", ascending=False).reset_index(drop=True)
 
 # ---------------------------
