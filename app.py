@@ -1,9 +1,10 @@
 # app.py
-# Miami-Dade Property & Market Insights Dashboard
+# Miami-Dade Property & Market Insights Dashboard (Tabbed UI)
 # - Folio lookup (MapServer first, FeatureServer fallback)
 # - Zoning mix by municipality
 # - Recent sales inside selected area
 # - CSV exports + bulk folio lookup
+# - Cleaner UI with tabs and improved errors
 
 import json
 import time
@@ -13,7 +14,6 @@ import pandas as pd
 import streamlit as st
 import folium
 
-# Safe import: streamlit-folium is optional
 try:
     from streamlit_folium import st_folium
 except ImportError:
@@ -28,11 +28,9 @@ MD_ZONING_FEATURESERVER = "https://services.arcgis.com/LBbVDC0hKPAnLRpO/ArcGIS/r
 LAYER_MUNICIPAL_BOUNDARY = 4
 LAYER_ZONING = 12
 
-# County MapServer with explicit FOLIO schema (reliable for folio lookups)
 PA_MAPSERVER = "https://gisweb.miamidade.gov/arcgis/rest/services/MD_Emaps/MapServer"
 LAYER_PROPERTY_RECORDS = 70
 
-# Hosted FeatureServer used for property point & sales
 PA_GISVIEW_FEATURESERVER = "https://services.arcgis.com/8Pc9XBTAsYuxx9Ny/arcgis/rest/services/PaGISView_gdb/FeatureServer"
 LAYER_PROPERTY_POINT_VIEW = 0
 
@@ -48,9 +46,7 @@ LINK_ECONOMIC_DASH = "https://www.miamidade.gov/global/economy/innovation-and-ec
 # ---------------------------
 
 def format_md_folio(input_str: str):
-    """Return (hyphenated, digits) for a Miami-Dade folio input.
-    If the input has 13 digits, we format as xx-xxxx-xxx-xxxx.
-    """
+    """Return (hyphenated, digits) for a Miami-Dade folio input."""
     s = (input_str or "").strip()
     digits = "".join(ch for ch in s if ch.isdigit())
     if len(digits) == 13:
@@ -58,34 +54,22 @@ def format_md_folio(input_str: str):
         return hyph, digits
     return s, digits
 
-
 def pa_folio_url(folio: str) -> str:
     digits = "".join(ch for ch in (folio or "") if ch.isdigit())
     return f"https://www.miamidade.gov/Apps/PA/propertysearch/#/folio/{digits}" if digits else LINK_PROPERTY_APPRAISER
 
-
 @st.cache_data(show_spinner=False, ttl=60*60)
 def arcgis_query(service_url: str, layer: int, params: dict):
-    """Generic ArcGIS FeatureServer/MapServer query with polite error handling.
-    - POST for geometry/long queries (avoid 413)
-    - outSR only when returning geometry
-    """
+    """Generic ArcGIS FeatureServer/MapServer query with error handling."""
     base = f"{service_url}/{layer}/query"
-    defaults = {
-        "f": "json",
-        "where": "1=1",
-        "outFields": "*",
-        "returnGeometry": False,
-    }
+    defaults = {"f": "json", "where": "1=1", "outFields": "*", "returnGeometry": False}
     q = {**defaults, **(params or {})}
     if q.get("returnGeometry"):
         q.setdefault("outSR", 4326)
     try:
         use_post = ("geometry" in q) or (len(base) + len(str(q)) > 1800)
-        if use_post:
-            r = requests.post(base, data=q, timeout=30, headers={"Content-Type": "application/x-www-form-urlencoded"})
-        else:
-            r = requests.get(base, params=q, timeout=25)
+        r = requests.post(base, data=q, timeout=30, headers={"Content-Type":"application/x-www-form-urlencoded"}) if use_post \
+            else requests.get(base, params=q, timeout=25)
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict) and data.get("error"):
@@ -96,7 +80,6 @@ def arcgis_query(service_url: str, layer: int, params: dict):
         return None
 
 # Geometry simplification (Douglas–Peucker)
-
 def _perp(p, a, b):
     (x, y), (x1, y1), (x2, y2) = p, a, b
     if (x1, y1) == (x2, y2):
@@ -139,12 +122,9 @@ def simplify_rings(rings, tolerance_meters=25):
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def normalize_folios(text: str):
-    """Parse pasted text (newlines/commas/semicolons/tabs/spaces) and return
-    a list of unique, normalized folios (hyphenated xx-xxxx-xxx-xxxx when 13 digits are found).
-    """
+    """Parse pasted text and return unique, normalized 13-digit folios (hyphenated)."""
     if not text:
         return []
-    # Replace common separators with spaces
     text = (
         text.replace("\r", " ")
             .replace("\n", " ")
@@ -152,10 +132,8 @@ def normalize_folios(text: str):
             .replace(";", " ")
             .replace("\t", " ")
     )
-    # Find any 13-consecutive-digit sequences
     digits_list = re.findall(r"\d{13}", text)
-    out = []
-    seen = set()
+    out, seen = [], set()
     for d in digits_list:
         hyph = f"{d[0:2]}-{d[2:6]}-{d[6:9]}-{d[9:13]}"
         if d not in seen:
@@ -165,9 +143,7 @@ def normalize_folios(text: str):
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def fetch_municipalities():
-    data = arcgis_query(MD_ZONING_FEATURESERVER, LAYER_MUNICIPAL_BOUNDARY, {
-        "outFields": "NAME", "returnGeometry": True
-    })
+    data = arcgis_query(MD_ZONING_FEATURESERVER, LAYER_MUNICIPAL_BOUNDARY, {"outFields":"NAME","returnGeometry":True})
     items = []
     if data and data.get("features"):
         for f in data["features"]:
@@ -201,7 +177,7 @@ def geocode_address(addr: str):
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_layer_fields(service_url: str, layer: int):
     try:
-        meta = requests.get(f"{service_url}/{layer}", params={"f": "json"}, timeout=20).json()
+        meta = requests.get(f"{service_url}/{layer}", params={"f":"json"}, timeout=20).json()
         fields = meta.get("fields", []) if isinstance(meta, dict) else []
         return {(f.get("name") or "").lower(): f for f in fields}
     except Exception:
@@ -209,13 +185,8 @@ def get_layer_fields(service_url: str, layer: int):
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def get_property_by_folio(folio: str, prefer_mapserver: bool = True):
-    """Look up a property by folio.
-    A) Try county MapServer/70 (FOLIO) first; B) fall back to hosted FeatureServer/0.
-    Returns {"attributes": normalized_dict, "source": str, "where_used": str} or None.
-    """
     if not folio:
         return None
-
     raw = str(folio).strip()
     digits = "".join(ch for ch in raw if ch.isdigit())
 
@@ -309,9 +280,6 @@ def get_property_by_folio(folio: str, prefer_mapserver: bool = True):
 
 @st.cache_data(show_spinner=False, ttl=30*60)
 def bulk_properties_by_folios(folio_list, prefer_mapserver: bool = True, sleep_sec: float = 0.15):
-    """Lookup many folios and return a DataFrame of normalized export rows with status.
-    folio_list: iterable of folio strings (hyphenated or digits).
-    """
     rows = []
     for fol in folio_list:
         hyph, digits = format_md_folio(fol)
@@ -391,7 +359,6 @@ def get_zones_in_polygon(rings):
 
 @st.cache_data(show_spinner=False, ttl=30*60)
 def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
-    """Recent sales inside polygon using FeatureServer/0; paginate + client-side date filter."""
     def _paged(base_params, step=2000, cap=max_rows):
         rows, offset = [], 0
         while len(rows) < cap:
@@ -431,8 +398,6 @@ def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
         return pd.DataFrame(columns=["folio","true_site_addr","true_site_city","true_site_zip_code","true_owner1","dateofsale_utc","price_1","dor_desc","subdivision","year_built","lot_size","building_heated_area"])
 
     df = pd.DataFrame(attrs)
-
-    # Detect & parse sale date
     candidate_cols = ["dateofsale_utc","dateofsale","sale_date","last_sale_date","date_of_sale","saledate"]
     date_col = next((c for c in candidate_cols if c in df.columns), None)
     if date_col:
@@ -490,12 +455,10 @@ with st.sidebar:
     st.markdown(f"- 🗺️ GIS Hub: [Open Data]({LINK_GIS_HUB})  ")
     st.markdown(f"- 📊 Econ & Planning: [Research Reports]({LINK_PLANNING_RESEARCH}) · [Metrics Dashboard]({LINK_ECONOMIC_DASH})  ")
 
-col_map, col_info = st.columns([1.2, 0.8])
-
-# --- Map column ---
-with col_map:
+# Map on top (always visible)
+map_col = st.container()
+with map_col:
     m = folium.Map(location=[25.774, -80.193], zoom_start=10, control_scale=True)
-
     selected_poly = None
     if selected_muni != "(none)" and muni_items:
         match = next((it for it in muni_items if it["name"] == selected_muni), None)
@@ -505,7 +468,6 @@ with col_map:
             lats = [lat for lon, lat in match["rings"][0]]
             lons = [lon for lon, lat in match["rings"][0]]
             m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
-
     pt_latlon = None
     if addr:
         loc = geocode_address(addr)
@@ -515,16 +477,16 @@ with col_map:
             if not selected_poly:
                 m.location = [loc[0], loc[1]]
                 m.zoom_start = 15
-
     if st_folium:
-        st_folium(m, width=None, height=600)
+        st_folium(m, width=None, height=480)
     else:
         st.warning("streamlit-folium not installed. Map preview disabled. Please add 'streamlit-folium' to requirements.txt.")
 
-# --- Info column ---
-with col_info:
-    st.subheader("Property by Folio")
+# Tabs for content
+tab_prop, tab_bulk, tab_area = st.tabs(["🏠 Property Info", "📦 Bulk Search", "🗺️ Area Insights"])
 
+with tab_prop:
+    st.subheader("Property by Folio")
     src_choice = st.radio(
         "Data source for folio lookup",
         ["MapServer first (recommended)", "FeatureServer first (fallback)"],
@@ -553,7 +515,7 @@ with col_info:
                 if owners:
                     st.markdown("**Owner(s):**  ")
                     st.markdown(owners, unsafe_allow_html=True)
-            # Use & zoning labels (if available)
+            # Use & zoning labels
             pa_zone = a.get('pa_primary_zone')
             use_desc = a.get('primarylanduse_desc') or a.get('dor_desc')
             subdiv = a.get('subdivision')
@@ -562,7 +524,7 @@ with col_info:
             if use_desc: parts.append(f"**Primary Land Use:** {use_desc}")
             if subdiv:   parts.append(f"**Subdivision:** {subdiv}")
             if parts:    st.markdown("  • ".join(parts))
-            # Building details table
+            # Building details
             kmap = {
                 "bedrooms": "Beds",
                 "bathrooms": "Baths",
@@ -586,7 +548,7 @@ with col_info:
             with st.expander("Folio lookup diagnostics"):
                 st.write({"source": result.get("source"), "where_used": result.get("where_used")})
 
-            # --- CSV export for this property ---
+            # CSV export (single)
             export = {
                 "Folio": a.get('folio') or folio,
                 "Property Address": a.get('true_site_addr'),
@@ -610,122 +572,113 @@ with col_info:
                 "PA Folio URL": pa_folio_url(a.get('folio') or folio),
             }
             df_prop = pd.DataFrame([export])
-            csv_prop = df_prop.to_csv(index=False).encode('utf-8')
             st.download_button(
                 "⬇️ Download this property (CSV)",
-                data=csv_prop,
+                data=df_prop.to_csv(index=False).encode('utf-8'),
                 file_name=f"property_{''.join(ch for ch in (a.get('folio') or folio) if ch.isdigit())}.csv",
                 mime="text/csv",
             )
-
-            # --- Bulk export UI ---
-            st.markdown("---")
-            st.markdown("### Bulk folio lookup & export")
-            st.caption("Paste multiple folios (digits or hyphenated), one-per-line or separated by commas/semicolons/tabs. Or upload a CSV with a column named 'folio'.")
-            bulk_text = st.text_area(
-                "Paste folios here",
-                height=120,
-                placeholder="3530070191100\\n0131234567890\\n01-2345-678-9012, 1133260050000",
-            )
-            upload = st.file_uploader("…or upload a CSV with a 'folio' column", type=["csv"])
-
-            input_folios = []
-            if bulk_text:
-                input_folios.extend(normalize_folios(bulk_text))
-            if upload is not None:
-                try:
-                    df_up = pd.read_csv(upload)
-                    if 'folio' in df_up.columns:
-                        for v in df_up['folio'].astype(str).tolist():
-                            h, d = format_md_folio(v)
-                            input_folios.append(h or d)
-                except Exception as e:
-                    st.error(f"Could not read CSV: {e}")
-
-            input_folios = [f for f in dict.fromkeys(input_folios)]  # de-dupe while preserving order
-            if input_folios:
-                st.write(f"Detected **{len(input_folios)}** folio(s). Duplicates will be ignored in results.")
-                if st.button("Run bulk lookup"):
-                    with st.spinner("Fetching properties…"):
-                        df_bulk = bulk_properties_by_folios(input_folios, prefer_mapserver=prefer_mapserver)
-                    if not df_bulk.empty:
-                        if 'Folio' in df_bulk.columns:
-                            df_bulk = df_bulk.drop_duplicates(subset=['Folio'], keep='first')
-                        st.dataframe(df_bulk, use_container_width=True)
-                        csv_bulk = df_bulk.to_csv(index=False).encode('utf-8')
-                        st.download_button("⬇️ Download bulk results (CSV)", data=csv_bulk, file_name="mdc_properties_bulk.csv", mime="text/csv")
-                    else:
-                        st.info("No results returned for the provided folios.")
-            else:
-                st.caption("Provide folios above to enable bulk lookup.")
-
         else:
-            st.info("No property found for that folio via the selected source(s). Try the other source above, or open the Property Appraiser link.")
-    else:
-        st.caption("Enter a 13-digit folio in the sidebar to see property details here.")
+            st.error("No property found for that folio via the selected source(s).")
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                if st.button("Retry with other source"):
+                    prefer_mapserver = not prefer_mapserver
+                    st.rerun()
+            with cc2:
+                st.link_button("Open Property Appraiser (Folio tab)", pa_folio_url(folio))
+            st.caption("Tips: ensure 13 digits; try both formats (xx-xxxx-xxx-xxxx and 13 digits).")
 
-    st.subheader("Property & Zoning at Location")
-    if pt_latlon:
-        z = get_zoning_at_point(lon=pt_latlon[1], lat=pt_latlon[0])
-        if z:
-            st.success(
-                f"**Zoning:** {z.get('ZONE')}  "
-                + (f"*{z.get('ZONE_DESC')}*  " if z.get('ZONE_DESC') else "")
-                + (f"**Overlay:** {z.get('OVLY')}  " if z.get('OVLY') else "")
-                + (f"**Jurisdiction:** {z.get('ZONEMUNC')}" if z.get('ZONEMUNC') else "")
-            )
-        else:
-            st.info("No zoning polygon found at this point (or service busy). Try moving the point or selecting a municipality.")
     else:
-        st.caption("Enter an address in the sidebar to see zoning at that point.")
+        st.info("Enter a 13-digit folio in the sidebar to see property details here.")
 
-    st.subheader("Official Lookups")
-    st.markdown(
-        f"**Property Appraiser:** <a href='{LINK_PROPERTY_APPRAISER}' target='_blank'>Open search</a><br/>"
-        f"<small>Use tabs to search by Address, Owner, or Folio. See <a href='{LINK_PROPERTY_APPRAISER_HELP}' target='_blank'>help</a>.</small>",
-        unsafe_allow_html=True,
+with tab_bulk:
+    st.subheader("Bulk folio lookup & CSV export")
+    src_choice_bulk = st.radio(
+        "Data source order",
+        ["MapServer first (recommended)", "FeatureServer first (fallback)"],
+        horizontal=True,
+        index=0,
+        key="bulk_source_choice",
     )
-    st.markdown(f"**Clerk of Courts (Official Records):** <a href='{LINK_CLERK_OFFICIAL_RECORDS}' target='_blank'>Open search</a>", unsafe_allow_html=True)
+    prefer_mapserver_bulk = (src_choice_bulk == "MapServer first (recommended)")
 
-# --- Area summaries ---
-if selected_poly:
-    st.markdown("---")
-    st.subheader(f"Zoning mix in **{selected_muni}**")
-    df_z = get_zones_in_polygon(selected_poly)
-    if not df_z.empty:
-        st.dataframe(df_z, use_container_width=True, hide_index=True)
-        csv_z = df_z.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download zoning table (CSV)", data=csv_z, file_name=f"{selected_muni}_zoning.csv", mime="text/csv")
-    else:
-        st.info("Zoning summary not available right now.")
+    st.caption("Paste multiple folios (digits or hyphenated), separated by newlines/commas/semicolons/tabs — or upload a CSV with a column named 'folio'.")
+    bulk_text = st.text_area(
+        "Paste folios here",
+        height=140,
+        placeholder="3530070191100\\n0131234567890\\n01-2345-678-9012, 1133260050000",
+    )
+    upload = st.file_uploader("…or upload a CSV with a 'folio' column", type=["csv"])
 
-    st.subheader(f"Recent sales in **{selected_muni}** (last {sales_window} days)")
-    with st.expander("Diagnostics (service + query)"):
-        st.caption("If results look empty, check the counts below to confirm live data.")
-        st.write({"rings_vertices": sum(len(r) for r in selected_poly), "sales_window_days": int(sales_window)})
-    df_sales = get_recent_sales_in_polygon(selected_poly, days=sales_window)
-    if not df_sales.empty:
-        show_cols = {
-            "dateofsale_utc": "Sale Date",
-            "price_1": "Price",
-            "true_site_addr": "Address",
-            "true_site_city": "City",
-            "true_site_zip_code": "ZIP",
-            "dor_desc": "Land Use",
-            "subdivision": "Subdivision",
-            "year_built": "Year Built",
-            "lot_size": "Lot SqFt",
-            "building_heated_area": "Heated SqFt",
-            "true_owner1": "Owner",
-            "folio": "Folio",
-        }
-        df_show = df_sales.rename(columns=show_cols)
-        st.dataframe(df_show, use_container_width=True)
-        csv_sales = df_show.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download recent sales (CSV)", data=csv_sales, file_name=f"{selected_muni}_recent_sales_{sales_window}d.csv", mime="text/csv")
-        st.caption("Source: Miami-Dade Property Point View (PaGISView_gdb)")
+    input_folios = []
+    if bulk_text:
+        input_folios.extend(normalize_folios(bulk_text))
+    if upload is not None:
+        try:
+            df_up = pd.read_csv(upload)
+            if 'folio' in df_up.columns:
+                for v in df_up['folio'].astype(str).tolist():
+                    h, d = format_md_folio(v)
+                    input_folios.append(h or d)
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
+
+    input_folios = [f for f in dict.fromkeys(input_folios)]  # de-dupe
+    st.write(f"Detected **{len(input_folios)}** folio(s).") if input_folios else st.caption("Provide folios above to enable bulk lookup.")
+
+    if input_folios and st.button("Run bulk lookup"):
+        with st.spinner("Fetching properties…"):
+            df_bulk = bulk_properties_by_folios(input_folios, prefer_mapserver=prefer_mapserver_bulk)
+        if not df_bulk.empty:
+            if 'Folio' in df_bulk.columns:
+                df_bulk = df_bulk.drop_duplicates(subset=['Folio'], keep='first')
+            st.dataframe(df_bulk, use_container_width=True)
+            st.download_button("⬇️ Download bulk results (CSV)", data=df_bulk.to_csv(index=False).encode('utf-8'), file_name="mdc_properties_bulk.csv", mime="text/csv")
+        else:
+            st.info("No results returned for the provided folios.")
+
+with tab_area:
+    st.subheader("Area insights (zoning & sales)")
+    if selected_muni and selected_muni != "(none)":
+        # Zoning
+        st.markdown(f"**Zoning mix in {selected_muni}**")
+        df_z = get_zones_in_polygon(selected_poly) if selected_poly else pd.DataFrame()
+        if not df_z.empty:
+            st.dataframe(df_z, use_container_width=True, hide_index=True)
+            st.download_button("⬇️ Download zoning table (CSV)", data=df_z.to_csv(index=False).encode("utf-8"), file_name=f"{selected_muni}_zoning.csv", mime="text/csv")
+        else:
+            st.info("Zoning summary not available right now.")
+
+        # Sales
+        st.markdown(f"**Recent sales in {selected_muni}** (last {sales_window} days)")
+        with st.expander("Diagnostics (service + query)"):
+            st.caption("If results look empty, check the counts below to confirm live data.")
+            st.write({"rings_vertices": sum(len(r) for r in selected_poly) if selected_poly else 0, "sales_window_days": int(sales_window)})
+        df_sales = get_recent_sales_in_polygon(selected_poly, days=sales_window) if selected_poly else pd.DataFrame()
+        if not df_sales.empty:
+            show_cols = {
+                "dateofsale_utc": "Sale Date",
+                "price_1": "Price",
+                "true_site_addr": "Address",
+                "true_site_city": "City",
+                "true_site_zip_code": "ZIP",
+                "dor_desc": "Land Use",
+                "subdivision": "Subdivision",
+                "year_built": "Year Built",
+                "lot_size": "Lot SqFt",
+                "building_heated_area": "Heated SqFt",
+                "true_owner1": "Owner",
+                "folio": "Folio",
+            }
+            df_show = df_sales.rename(columns=show_cols)
+            st.dataframe(df_show, use_container_width=True)
+            st.download_button("⬇️ Download recent sales (CSV)", data=df_show.to_csv(index=False).encode("utf-8"), file_name=f"{selected_muni}_recent_sales_{sales_window}d.csv", mime="text/csv")
+            st.caption("Source: Miami-Dade Property Point View (PaGISView_gdb)")
+        else:
+            st.warning("No recent sales returned. Try increasing days or selecting a different municipality.")
     else:
-        st.warning("No recent sales returned. This can happen if the service is caching, date math differs, or the area/time window has few records. Try increasing days or changing the municipality.")
+        st.info("Pick a municipality in the left sidebar to see its zoning mix and recent sales.")
 
 with st.expander("📊 Planning, Research & Economic Analysis – quick links"):
     st.write("Use these official dashboards and PDFs for countywide labor market, GDP, and office market context.")
