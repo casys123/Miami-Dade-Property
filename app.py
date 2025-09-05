@@ -3,8 +3,9 @@
 # - Folio lookup (MapServer first, FeatureServer fallback)
 # - Zoning mix by municipality
 # - Recent sales inside selected area
+# - House Sale Report tab (KPIs, ZIP/Subdivision breakdowns, weekly trend)
 # - CSV exports + bulk folio lookup
-# - Cleaner UI with tabs and improved errors / retries
+# - Robust networking (retries), safer geometry, friendlier fallbacks
 
 import json
 import time
@@ -75,7 +76,6 @@ def get_http() -> requests.Session:
     s.mount("http://", adapter)
     s.mount("https://", adapter)
     s.headers.update({
-        # Nominatim requires identifying UA. Keep it generic, no secrets here.
         "User-Agent": "mdc-insights/1.4 (+info@miamimasterflooring.com)"
     })
     return s
@@ -125,7 +125,6 @@ def arcgis_query(service_url: str, layer: int, params: Dict[str, Any]) -> Option
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict) and data.get("error"):
-            # Normalize ArcGIS error into a single message
             err = data["error"]
             msg = err.get("message") or err
             st.info(f"ArcGIS error (layer {layer}): {msg}")
@@ -170,7 +169,6 @@ def simplify_rings(rings, tolerance_meters=25):
         core = ring[:-1] if closed and len(ring) > 1 else ring
         simp = _dp(core, eps_deg)
         if closed and simp:
-            # ensure closure stays intact
             if simp[0] != simp[-1]:
                 simp.append(simp[0])
         out.append(simp)
@@ -211,7 +209,6 @@ def fetch_municipalities():
             g = f.get("geometry", {}) or {}
             name = a.get("NAME") or a.get("Municipality") or a.get("municipality")
             rings = (g or {}).get("rings") or []
-            # Keep first exterior ring for robustness
             if name and rings and rings[0]:
                 items.append({"name": name, "rings": [rings[0]]})
     return sorted(items, key=lambda x: x["name"]) if items else []
@@ -271,7 +268,6 @@ def get_property_by_folio(folio: str, prefer_mapserver: bool = True):
         if hyphenated: wheres.append(f"FOLIO = '{esc(hyphenated)}'")
         if digits and len(digits) == 13:
             wheres.append(f"FOLIO = '{esc(digits)}'")
-            # LIKE as a last resort
             wheres.append(f"FOLIO LIKE '%{esc(digits)}%'")
         for w in wheres:
             data = arcgis_query(PA_MAPSERVER, LAYER_PROPERTY_RECORDS, {
@@ -382,7 +378,6 @@ def bulk_properties_by_folios(folio_list, prefer_mapserver: bool = True, sleep_s
             rows.append({"Folio": key, "Status": f"ERROR: {e}"})
         time.sleep(max(0.0, sleep_sec))
     df = pd.DataFrame(rows)
-    # De-dupe by Folio if present
     if not df.empty and "Folio" in df.columns:
         df = df.drop_duplicates(subset=["Folio"], keep="first")
     return df
@@ -493,7 +488,6 @@ def get_recent_sales_in_polygon(rings, days: int = 90, max_rows: int = 5000):
 
     if "dateofsale_utc" in df.columns:
         try:
-            # Normalize to naive UTC for display/sorting consistency
             df["dateofsale_utc"] = pd.to_datetime(df["dateofsale_utc"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
         except Exception:
             pass
@@ -513,7 +507,7 @@ with st.sidebar:
 
     st.markdown("**Look up specific properties** (opens official sites in a new tab):")
     addr = st.text_input("Address (for map & Property Appraiser link)")
-    owner = st.text_input("Owner Name (for Property Appraiser & Clerk search)")  # reserved for future external links
+    owner = st.text_input("Owner Name (for Property Appraiser & Clerk search)")
     folio_input = st.text_input("Folio Number (13 digits)")
     folio_hyph, folio_digits = format_md_folio(folio_input)
     if folio_digits and len(folio_digits) == 13 and folio_input != folio_hyph:
@@ -554,8 +548,7 @@ with map_col:
         match = next((it for it in muni_items if it["name"] == selected_muni), None)
         if match:
             selected_poly = match["rings"]
-            # ArcGIS rings are [x, y] => [lon, lat]
-            ring_xy = match["rings"][0]
+            ring_xy = match["rings"][0]  # ArcGIS rings are [x, y] => [lon, lat]
             folium.Polygon(
                 locations=[(lat, lon) for lon, lat in ring_xy],
                 tooltip=selected_muni, weight=2, fill=False
@@ -569,7 +562,6 @@ with map_col:
             pt_latlon = loc
             folium.Marker(location=[loc[0], loc[1]], tooltip=addr).add_to(m)
             if not selected_poly:
-                # Center if no polygon selected
                 m.location = [loc[0], loc[1]]
                 m.zoom_start = 15
 
@@ -581,7 +573,9 @@ with map_col:
 # ---------------------------
 # Tabs
 # ---------------------------
-tab_prop, tab_bulk, tab_area = st.tabs(["🏠 Property Info", "📦 Bulk Search", "🗺️ Area Insights"])
+tab_prop, tab_bulk, tab_area, tab_report = st.tabs(
+    ["🏠 Property Info", "📦 Bulk Search", "🗺️ Area Insights", "📈 Sales Report"]
+)
 
 with tab_prop:
     st.subheader("Property by Folio")
@@ -645,10 +639,8 @@ with tab_prop:
                 df_disp.columns = ["Attribute", "Value"]
                 st.dataframe(df_disp, use_container_width=True, hide_index=True)
 
-            # Links
             st.link_button("Open in Property Appraiser (Folio tab)", pa_folio_url(a.get('folio') or folio))
 
-            # Diagnostics
             with st.expander("Folio lookup diagnostics"):
                 st.write({"source": result.get("source"), "where_used": result.get("where_used")})
 
@@ -729,7 +721,6 @@ with tab_bulk:
         except Exception as e:
             st.error(f"Could not read CSV: {e}")
 
-    # de-dupe while preserving order
     input_folios = list(dict.fromkeys([f for f in input_folios if f]))
 
     if input_folios:
@@ -768,7 +759,7 @@ with tab_area:
         else:
             st.info("Zoning summary not available right now.")
 
-        # Sales
+        # Sales (basic table)
         st.markdown(f"**Recent sales in {selected_muni}** (last {int(sales_window)} days)")
         with st.expander("Diagnostics (service + query)"):
             st.caption("If results look empty, check the counts below to confirm live data.")
@@ -776,9 +767,8 @@ with tab_area:
                 "rings_vertices": sum(len(r) for r in selected_poly) if selected_poly else 0,
                 "sales_window_days": int(sales_window)
             })
-
-        df_sales = get_recent_sales_in_polygon(selected_poly, days=sales_window) if selected_poly else pd.DataFrame()
-        if not df_sales.empty:
+        df_sales_basic = get_recent_sales_in_polygon(selected_poly, days=sales_window) if selected_poly else pd.DataFrame()
+        if not df_sales_basic.empty:
             show_cols = {
                 "dateofsale_utc": "Sale Date",
                 "price_1": "Price",
@@ -793,11 +783,11 @@ with tab_area:
                 "true_owner1": "Owner",
                 "folio": "Folio",
             }
-            df_show = df_sales.rename(columns=show_cols)
-            st.dataframe(df_show, use_container_width=True)
+            df_show_basic = df_sales_basic.rename(columns=show_cols)
+            st.dataframe(df_show_basic, use_container_width=True)
             st.download_button(
                 "⬇️ Download recent sales (CSV)",
-                data=df_show.to_csv(index=False).encode("utf-8"),
+                data=df_show_basic.to_csv(index=False).encode("utf-8"),
                 file_name=f"{selected_muni}_recent_sales_{int(sales_window)}d.csv",
                 mime="text/csv"
             )
@@ -806,6 +796,141 @@ with tab_area:
             st.warning("No recent sales returned. Try increasing days or selecting a different municipality.")
     else:
         st.info("Pick a municipality in the left sidebar to see its zoning mix and recent sales.")
+
+with tab_report:
+    st.subheader("📈 House Sale Report")
+    if selected_muni and selected_muni != "(none)":
+        st.markdown(f"**Area:** {selected_muni}  •  **Window:** last {int(sales_window)} days")
+
+        with st.expander("Diagnostics (service + query)"):
+            st.caption("If results look empty, check the counts below to confirm live data.")
+            st.write({
+                "rings_vertices": sum(len(r) for r in selected_poly) if selected_poly else 0,
+                "sales_window_days": int(sales_window)
+            })
+
+        df_sales = get_recent_sales_in_polygon(selected_poly, days=sales_window) if selected_poly else pd.DataFrame()
+        if not df_sales.empty:
+            # Normalize columns for display/reporting
+            show_cols = {
+                "dateofsale_utc": "Sale Date",
+                "price_1": "Price",
+                "true_site_addr": "Address",
+                "true_site_city": "City",
+                "true_site_zip_code": "ZIP",
+                "dor_desc": "Land Use",
+                "subdivision": "Subdivision",
+                "year_built": "Year Built",
+                "lot_size": "Lot SqFt",
+                "building_heated_area": "Heated SqFt",
+                "true_owner1": "Owner",
+                "folio": "Folio",
+            }
+            df_show = df_sales.rename(columns=show_cols).copy()
+
+            # Ensure numeric types where needed
+            for c in ["Price", "Lot SqFt", "Heated SqFt", "Year Built"]:
+                if c in df_show.columns:
+                    df_show[c] = pd.to_numeric(df_show[c], errors="coerce")
+
+            # KPIs
+            total_sales = len(df_show)
+            total_volume = float(df_show["Price"].sum()) if "Price" in df_show else 0.0
+            avg_price = float(df_show["Price"].mean()) if "Price" in df_show else 0.0
+            med_price = float(df_show["Price"].median()) if "Price" in df_show else 0.0
+
+            # PPSF
+            if {"Price", "Heated SqFt"}.issubset(df_show.columns):
+                df_ppsf = df_show[df_show["Heated SqFt"] > 0].copy()
+                df_ppsf["PPSF"] = df_ppsf["Price"] / df_ppsf["Heated SqFt"]
+                avg_ppsf = float(df_ppsf["PPSF"].mean()) if not df_ppsf.empty else 0.0
+                med_ppsf = float(df_ppsf["PPSF"].median()) if not df_ppsf.empty else 0.0
+            else:
+                avg_ppsf = 0.0
+                med_ppsf = 0.0
+
+            # KPI strip
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("Sales", f"{total_sales:,}")
+            k2.metric("Total Volume", f"${total_volume:,.0f}")
+            k3.metric("Avg Price", f"${avg_price:,.0f}")
+            k4.metric("Median Price", f"${med_price:,.0f}")
+            k5.metric("Median PPSF", f"${med_ppsf:,.0f}")
+
+            # Master table
+            st.markdown("### All Recent Sales")
+            st.dataframe(df_show, use_container_width=True)
+            st.download_button(
+                "⬇️ Download all recent sales (CSV)",
+                data=df_show.to_csv(index=False).encode("utf-8"),
+                file_name=f"{selected_muni}_recent_sales_{int(sales_window)}d.csv",
+                mime="text/csv"
+            )
+            st.caption("Source: Miami-Dade Property Point View (PaGISView_gdb)")
+
+            # ZIP breakdown
+            st.markdown("### Sales by ZIP")
+            if "ZIP" in df_show.columns and "Price" in df_show.columns:
+                df_zip = (
+                    df_show.groupby("ZIP", dropna=True, as_index=False)
+                    .agg(Sales=("Price","size"), Median_Price=("Price","median"), Avg_Price=("Price","mean"))
+                    .sort_values(["Sales","Median_Price"], ascending=[False, False])
+                )
+                st.dataframe(df_zip, use_container_width=True)
+                st.download_button(
+                    "⬇️ Download ZIP breakdown (CSV)",
+                    data=df_zip.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{selected_muni}_zip_breakdown_{int(sales_window)}d.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.info("ZIP data not available in the result set.")
+
+            # Subdivision breakdown
+            st.markdown("### Top Subdivisions")
+            if "Subdivision" in df_show.columns and "Price" in df_show.columns:
+                df_sub = (
+                    df_show.groupby("Subdivision", dropna=True, as_index=False)
+                    .agg(Sales=("Price","size"), Median_Price=("Price","median"), Avg_Price=("Price","mean"))
+                    .sort_values(["Sales","Median_Price"], ascending=[False, False])
+                    .head(15)
+                )
+                st.dataframe(df_sub, use_container_width=True)
+                st.download_button(
+                    "⬇️ Download subdivision breakdown (CSV)",
+                    data=df_sub.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{selected_muni}_subdivisions_top15_{int(sales_window)}d.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.info("Subdivision data not available in the result set.")
+
+            # Weekly time trend
+            st.markdown("### Weekly Sales Trend (count & median price)")
+            if "Sale Date" in df_show.columns and "Price" in df_show.columns:
+                df_time = df_show.dropna(subset=["Sale Date"]).copy()
+                try:
+                    df_time["Week"] = pd.to_datetime(df_time["Sale Date"]).dt.to_period("W").dt.start_time
+                    df_week = (
+                        df_time.groupby("Week", as_index=False)
+                        .agg(Sales=("Price","size"), Median_Price=("Price","median"))
+                        .sort_values("Week")
+                    )
+                    st.dataframe(df_week, use_container_width=True)
+                    st.download_button(
+                        "⬇️ Download weekly trend (CSV)",
+                        data=df_week.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{selected_muni}_weekly_trend_{int(sales_window)}d.csv",
+                        mime="text/csv"
+                    )
+                except Exception:
+                    st.info("Could not build time trend from the available dates.")
+            else:
+                st.info("Date/Price columns not sufficient to build a weekly trend.")
+        else:
+            st.warning("No recent sales returned. Try increasing days or selecting a different municipality.")
+    else:
+        st.info("Pick a municipality in the left sidebar to generate the report.")
 
 with st.expander("📊 Planning, Research & Economic Analysis – quick links"):
     st.write("Use these official dashboards and PDFs for countywide labor market, GDP, and office market context.")
